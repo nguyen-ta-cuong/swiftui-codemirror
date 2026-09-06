@@ -331,6 +331,360 @@ final class CodeMirrorSessionTests: XCTestCase {
       })
   }
 
+  func testPreservedSelectionsStayOnScalarBoundariesForReplacementAndReconciliation() async throws {
+    let session = CodeMirrorSession(initialText: "ab") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(replicaID: replicaID, isFocused: { false }, send: { _ in })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+    session.receive(
+      .selection(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        selection: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1)
+      ))
+
+    let replaced = try await session.replace(text: "😀", preservingSelections: true)
+    XCTAssertEqual(replaced.text, "😀")
+    XCTAssertEqual(
+      replaced.selections[replicaID],
+      CodeMirrorSelection(anchorUTF16: 0, headUTF16: 0)
+    )
+
+    session.receive(
+      .transaction(
+        CodeMirrorTransaction(
+          sessionID: session.id,
+          replicaID: replicaID,
+          loadID: loadID,
+          baseRevision: replaced.revision,
+          revision: CodeMirrorRevision(replaced.revision.rawValue + 1),
+          changes: [CodeMirrorChange(rangeUTF16: 0..<0, insertedText: "x")],
+          selectionBefore: CodeMirrorSelection(anchorUTF16: 0, headUTF16: 0),
+          selectionAfter: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1)
+        )))
+    XCTAssertEqual(try session.snapshot().text, "x😀")
+
+    var shouldReplaceAuthoritatively = true
+    let authoritativeSession = CodeMirrorSession(initialText: "ab") { event in
+      if shouldReplaceAuthoritatively, case .transaction = event {
+        shouldReplaceAuthoritatively = false
+        return .replace(authoritativeText: "😀")
+      }
+      return .accept
+    }
+    let authoritativeReplicaID = CodeMirrorReplicaID()
+    let authoritativeLoadID = try authoritativeSession.attach(
+      replicaID: authoritativeReplicaID, isFocused: { false }, send: { _ in })
+    authoritativeSession.receive(
+      .ready(
+        sessionID: authoritativeSession.id,
+        replicaID: authoritativeReplicaID,
+        loadID: authoritativeLoadID
+      ))
+    authoritativeSession.receive(
+      .selection(
+        sessionID: authoritativeSession.id,
+        replicaID: authoritativeReplicaID,
+        loadID: authoritativeLoadID,
+        revision: .zero,
+        selection: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1)
+      ))
+    authoritativeSession.receive(
+      .transaction(
+        CodeMirrorTransaction(
+          sessionID: authoritativeSession.id,
+          replicaID: authoritativeReplicaID,
+          loadID: authoritativeLoadID,
+          baseRevision: .zero,
+          revision: CodeMirrorRevision(1),
+          changes: [CodeMirrorChange(rangeUTF16: 1..<1, insertedText: "x")],
+          selectionBefore: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1),
+          selectionAfter: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1)
+        )))
+
+    let authoritativeSnapshot = try authoritativeSession.snapshot()
+    XCTAssertEqual(authoritativeSnapshot.text, "😀")
+    XCTAssertEqual(
+      authoritativeSnapshot.selections[authoritativeReplicaID],
+      CodeMirrorSelection(anchorUTF16: 0, headUTF16: 0)
+    )
+    authoritativeSession.receive(
+      .transaction(
+        CodeMirrorTransaction(
+          sessionID: authoritativeSession.id,
+          replicaID: authoritativeReplicaID,
+          loadID: authoritativeLoadID,
+          baseRevision: authoritativeSnapshot.revision,
+          revision: CodeMirrorRevision(authoritativeSnapshot.revision.rawValue + 1),
+          changes: [CodeMirrorChange(rangeUTF16: 0..<0, insertedText: "x")],
+          selectionBefore: CodeMirrorSelection(anchorUTF16: 0, headUTF16: 0),
+          selectionAfter: CodeMirrorSelection(anchorUTF16: 1, headUTF16: 1)
+        )))
+    XCTAssertEqual(try authoritativeSession.snapshot().text, "x😀")
+  }
+
+  func testReplaceImmediatelyRejectsInvalidAndStaleChangesAtomically() throws {
+    let session = CodeMirrorSession(initialText: "one") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let unknownReplicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+    commands.removeAll()
+
+    XCTAssertThrowsError(
+      try session.replaceImmediately(
+        expectedRevision: CodeMirrorRevision(1),
+        changes: [CodeMirrorChange(rangeUTF16: 0..<3, insertedText: "two")],
+        in: replicaID
+      )
+    ) { error in
+      XCTAssertEqual(
+        error as? CodeMirrorSessionError,
+        .staleRevision(expected: .zero, actual: CodeMirrorRevision(1)))
+    }
+    XCTAssertThrowsError(
+      try session.replaceImmediately(
+        expectedRevision: .zero,
+        changes: [CodeMirrorChange(rangeUTF16: 4..<4, insertedText: "two")],
+        in: replicaID
+      )
+    ) { error in
+      XCTAssertEqual(error as? CodeMirrorSessionError, .malformedChange)
+    }
+    XCTAssertThrowsError(
+      try session.replaceImmediately(
+        expectedRevision: .zero,
+        changes: [CodeMirrorChange(rangeUTF16: 0..<3, insertedText: "two")],
+        in: unknownReplicaID
+      )
+    ) { error in
+      XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+    }
+
+    XCTAssertEqual(try session.snapshot().text, "one")
+    XCTAssertEqual(try session.snapshot().revision, .zero)
+    XCTAssertTrue(commands.isEmpty)
+  }
+
+  func testResolvedAppearanceTracksEnvironmentWithoutMutatingCallerConfiguration() throws {
+    let configuration = CodeMirrorConfiguration(
+      appearance: CodeMirrorAppearance(colorScheme: .system))
+    let dark = resolvedCodeMirrorAppearance(
+      configuration: configuration,
+      environmentScheme: .dark,
+      systemIncreaseContrast: true,
+      accessibilityReduceMotion: true,
+      accessibilityReduceTransparency: true
+    )
+    let light = resolvedCodeMirrorAppearance(
+      configuration: configuration,
+      environmentScheme: .light,
+      systemIncreaseContrast: false,
+      accessibilityReduceMotion: false,
+      accessibilityReduceTransparency: false
+    )
+
+    XCTAssertEqual(
+      dark,
+      CodeMirrorAppearance(
+        colorScheme: .dark, increaseContrast: true, reduceMotion: true, reduceTransparency: true))
+    XCTAssertEqual(light, CodeMirrorAppearance(colorScheme: .light))
+    XCTAssertEqual(configuration.appearance.colorScheme, .system)
+    XCTAssertFalse(configuration.appearance.increaseContrast)
+    XCTAssertFalse(configuration.appearance.reduceMotion)
+    XCTAssertFalse(configuration.appearance.reduceTransparency)
+  }
+
+  func testReplicaAppearanceUpdatesSkipIdenticalBroadcasts() throws {
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    let dark = CodeMirrorAppearance(colorScheme: .dark, increaseContrast: true)
+    let light = CodeMirrorAppearance(colorScheme: .light)
+
+    session.update(appearance: dark, for: replicaID)
+    session.update(appearance: light, for: replicaID)
+    session.update(appearance: light, for: replicaID)
+    session.update(configuration: session.configuration)
+
+    let configurations = commands.compactMap { command -> CodeMirrorConfiguration? in
+      if case .updateConfiguration(let configuration) = command { return configuration }
+      return nil
+    }
+    XCTAssertEqual(configurations.map(\.appearance), [dark, light])
+    XCTAssertEqual(session.configuration.appearance.colorScheme, .system)
+    session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
+  #if os(macOS)
+    func testReplaceImmediatelySupportsSynchronousUndoRedoWithoutEchoTransactions() throws {
+      var events: [CodeMirrorEvent] = []
+      let session = CodeMirrorSession(initialText: "one") { event in
+        events.append(event)
+        return .accept
+      }
+      let inlineReplicaID = CodeMirrorReplicaID()
+      let detachedReplicaID = CodeMirrorReplicaID()
+      var inlineCommands: [CodeMirrorHostCommand] = []
+      var detachedCommands: [CodeMirrorHostCommand] = []
+      let inlineLoadID = try session.attach(
+        replicaID: inlineReplicaID, isFocused: { false }, send: { inlineCommands.append($0) })
+      let detachedLoadID = try session.attach(
+        replicaID: detachedReplicaID, isFocused: { false }, send: { detachedCommands.append($0) })
+      session.receive(
+        .ready(sessionID: session.id, replicaID: inlineReplicaID, loadID: inlineLoadID))
+      session.receive(
+        .ready(sessionID: session.id, replicaID: detachedReplicaID, loadID: detachedLoadID))
+      inlineCommands.removeAll()
+      detachedCommands.removeAll()
+
+      let undoManager = UndoManager()
+      let undoTarget = NSObject()
+      var hostSnapshot = try session.snapshot()
+      var callbackPhases: [String] = []
+
+      func registerUndo(from previous: CodeMirrorSnapshot, to current: CodeMirrorSnapshot) {
+        undoManager.registerUndo(withTarget: undoTarget) { _ in
+          callbackPhases.append(
+            undoManager.isUndoing ? "undo" : undoManager.isRedoing ? "redo" : "outside")
+          let currentText = hostSnapshot.text
+          let replacement = try! session.replaceImmediately(
+            expectedRevision: hostSnapshot.revision,
+            changes: [
+              CodeMirrorChange(
+                rangeUTF16: 0..<currentText.utf16.count,
+                insertedText: previous.text,
+                removedText: currentText)
+            ],
+            selection: previous.selections[inlineReplicaID],
+            in: inlineReplicaID
+          )
+          hostSnapshot = replacement
+          registerUndo(from: current, to: replacement)
+        }
+      }
+
+      let before = hostSnapshot
+      let after = try session.replaceImmediately(
+        expectedRevision: before.revision,
+        changes: [
+          CodeMirrorChange(
+            rangeUTF16: 0..<before.text.utf16.count,
+            insertedText: "two",
+            removedText: before.text)
+        ],
+        selection: CodeMirrorSelection(anchorUTF16: 3, headUTF16: 3),
+        in: inlineReplicaID
+      )
+      hostSnapshot = after
+      registerUndo(from: before, to: after)
+
+      undoManager.undo()
+      XCTAssertEqual(hostSnapshot.text, "one")
+      XCTAssertEqual(hostSnapshot.revision, CodeMirrorRevision(2))
+      XCTAssertTrue(undoManager.canRedo)
+
+      undoManager.redo()
+      XCTAssertEqual(hostSnapshot.text, "two")
+      XCTAssertEqual(hostSnapshot.revision, CodeMirrorRevision(3))
+      XCTAssertTrue(undoManager.canUndo)
+      XCTAssertEqual(callbackPhases, ["undo", "redo"])
+      XCTAssertFalse(
+        events.contains {
+          if case .transaction = $0 { return true }
+          return false
+        })
+
+      func applyTexts(_ commands: [CodeMirrorHostCommand]) -> [String] {
+        commands.compactMap { command in
+          if case .apply(let snapshot) = command { return snapshot.text }
+          return nil
+        }
+      }
+      XCTAssertEqual(applyTexts(inlineCommands), ["two", "one", "two"])
+      XCTAssertEqual(applyTexts(detachedCommands), ["two", "one", "two"])
+    }
+  #endif
+
+  #if os(macOS) && canImport(AppKit) && canImport(WebKit)
+    func testCoordinatorCoalescesPreReadyCommandsAndRetainsFlushFormat() async throws {
+      let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+
+      for index in 0..<20 {
+        session.update(
+          appearance: CodeMirrorAppearance(
+            colorScheme: index.isMultiple(of: 2) ? .dark : .light,
+            increaseContrast: index.isMultiple(of: 3)),
+          for: replicaID)
+        let snapshot = try session.snapshot()
+        _ = try session.replaceImmediately(
+          expectedRevision: snapshot.revision,
+          changes: [
+            CodeMirrorChange(
+              rangeUTF16: 0..<snapshot.text.utf16.count,
+              insertedText: "source\(index)")
+          ],
+          in: replicaID
+        )
+      }
+
+      let flushTask = Task { @MainActor in try await session.flush() }
+      let formatTask = Task { @MainActor in try await session.format(in: replicaID) }
+      for _ in 0..<20 {
+        await Task.yield()
+      }
+      XCTAssertEqual(coordinator.pendingCommandCount, 4)
+
+      coordinator.detach()
+      let flushResult = await flushTask.result
+      let formatResult = await formatTask.result
+      if case .failure(let error) = flushResult {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+      } else {
+        XCTFail("detaching a pending flush unexpectedly succeeded")
+      }
+      if case .failure(let error) = formatResult {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+      } else {
+        XCTFail("detaching a pending format unexpectedly succeeded")
+      }
+    }
+  #endif
+
+  func testDetachingPendingFlushFailsInsteadOfCountingMissingReplicaAsAcknowledged() async throws {
+    let session = CodeMirrorSession(
+      initialText: "content",
+      configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 1_000)
+    ) { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(replicaID: replicaID, isFocused: { false }, send: { _ in })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+
+    let pending = Task { @MainActor in try await session.flush() }
+    for _ in 0..<10 {
+      await Task.yield()
+    }
+    session.detach(replicaID: replicaID, loadID: loadID)
+
+    let result = await pending.result
+    if case .failure(let error) = result {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+    } else {
+      XCTFail("detaching the pending replica unexpectedly acknowledged flush")
+    }
+    XCTAssertEqual(try session.snapshot().text, "content")
+  }
+
   func testFlushTimeoutKeepsSourceAndInvalidationResumesPendingFlush() async throws {
     let session = CodeMirrorSession(
       initialText: "content",

@@ -601,7 +601,7 @@ class EditorController {
       this.updateConfiguration(command.configuration);
       break;
     case "apply":
-      this.applySnapshot(command, false);
+      this.applySnapshot(command, true);
       break;
     case "reconcile":
       this.applySnapshot(command, Boolean(command.preserveLocalChanges));
@@ -674,6 +674,14 @@ class EditorController {
       ]
     });
     const name = this.configuration.editorName || "Code editor";
+    const colorScheme = this.configuration.appearance.colorScheme;
+    const cssColorScheme = colorScheme === "dark" || colorScheme === "light" ? colorScheme : "light dark";
+    this.documentRef.documentElement?.style?.setProperty("color-scheme", cssColorScheme);
+    this.documentRef.body?.style?.setProperty("color-scheme", cssColorScheme);
+    this.documentRef.body?.classList?.toggle(
+      "cm-host-reduce-transparency",
+      Boolean(this.configuration.appearance.reduceTransparency)
+    );
     this.view.dom.setAttribute("aria-label", name);
     this.view.dom.setAttribute("role", "textbox");
     this.view.dom.setAttribute("spellcheck", "false");

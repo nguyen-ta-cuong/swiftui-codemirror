@@ -7,6 +7,24 @@ import WebKit
   import UIKit
 #endif
 
+internal func resolvedCodeMirrorAppearance(
+  configuration: CodeMirrorConfiguration,
+  environmentScheme: CodeMirrorColorScheme,
+  systemIncreaseContrast: Bool,
+  accessibilityReduceMotion: Bool,
+  accessibilityReduceTransparency: Bool
+) -> CodeMirrorAppearance {
+  let configuredAppearance = configuration.appearance
+  return CodeMirrorAppearance(
+    colorScheme: configuredAppearance.colorScheme == .system
+      ? environmentScheme : configuredAppearance.colorScheme,
+    increaseContrast: configuredAppearance.increaseContrast || systemIncreaseContrast,
+    reduceMotion: configuredAppearance.reduceMotion || accessibilityReduceMotion,
+    reduceTransparency: configuredAppearance.reduceTransparency
+      || accessibilityReduceTransparency
+  )
+}
+
 #if canImport(AppKit)
   @MainActor
   public struct CodeMirrorEditor: NSViewRepresentable {
@@ -34,32 +52,29 @@ import WebKit
       let configuration = makeWebViewConfiguration(coordinator: coordinator)
       let webView = WKWebView(frame: .zero, configuration: configuration)
       webView.setValue(false, forKey: "drawsBackground")
-      session.update(configuration: resolvedConfiguration)
       coordinator.attach(webView: webView)
+      coordinator.update(appearance: resolvedAppearance)
       return webView
     }
 
     public func updateNSView(_ nsView: WKWebView, context: Context) {
-      session.update(configuration: resolvedConfiguration)
-      (context.coordinator as! CodeMirrorEditorCoordinator).update(webView: nsView)
+      let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
+      coordinator.update(appearance: resolvedAppearance)
+      coordinator.update(webView: nsView)
     }
 
     public static func dismantleNSView(_ nsView: WKWebView, coordinator: AnyObject) {
       (coordinator as? CodeMirrorEditorCoordinator)?.detach()
     }
 
-    private var resolvedConfiguration: CodeMirrorConfiguration {
-      let configuredAppearance = session.configuration.appearance
-      let environmentScheme: CodeMirrorColorScheme = colorScheme == .dark ? .dark : .light
-      let appearance = CodeMirrorAppearance(
-        colorScheme: configuredAppearance.colorScheme == .system
-          ? environmentScheme : configuredAppearance.colorScheme,
-        increaseContrast: configuredAppearance.increaseContrast || systemIncreaseContrast,
-        reduceMotion: configuredAppearance.reduceMotion || accessibilityReduceMotion,
-        reduceTransparency: configuredAppearance.reduceTransparency
-          || accessibilityReduceTransparency
+    private var resolvedAppearance: CodeMirrorAppearance {
+      resolvedCodeMirrorAppearance(
+        configuration: session.configuration,
+        environmentScheme: colorScheme == .dark ? .dark : .light,
+        systemIncreaseContrast: systemIncreaseContrast,
+        accessibilityReduceMotion: accessibilityReduceMotion,
+        accessibilityReduceTransparency: accessibilityReduceTransparency
       )
-      return session.configuration.withAppearance(appearance)
     }
 
     private var systemIncreaseContrast: Bool {
@@ -112,32 +127,29 @@ import WebKit
       let configuration = makeWebViewConfiguration(coordinator: coordinator)
       let webView = WKWebView(frame: .zero, configuration: configuration)
       webView.isOpaque = false
-      session.update(configuration: resolvedConfiguration)
       coordinator.attach(webView: webView)
+      coordinator.update(appearance: resolvedAppearance)
       return webView
     }
 
     public func updateUIView(_ uiView: WKWebView, context: Context) {
-      session.update(configuration: resolvedConfiguration)
-      (context.coordinator as! CodeMirrorEditorCoordinator).update(webView: uiView)
+      let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
+      coordinator.update(appearance: resolvedAppearance)
+      coordinator.update(webView: uiView)
     }
 
     public static func dismantleUIView(_ uiView: WKWebView, coordinator: AnyObject) {
       (coordinator as? CodeMirrorEditorCoordinator)?.detach()
     }
 
-    private var resolvedConfiguration: CodeMirrorConfiguration {
-      let configuredAppearance = session.configuration.appearance
-      let environmentScheme: CodeMirrorColorScheme = colorScheme == .dark ? .dark : .light
-      let appearance = CodeMirrorAppearance(
-        colorScheme: configuredAppearance.colorScheme == .system
-          ? environmentScheme : configuredAppearance.colorScheme,
-        increaseContrast: configuredAppearance.increaseContrast || systemIncreaseContrast,
-        reduceMotion: configuredAppearance.reduceMotion || accessibilityReduceMotion,
-        reduceTransparency: configuredAppearance.reduceTransparency
-          || accessibilityReduceTransparency
+    private var resolvedAppearance: CodeMirrorAppearance {
+      resolvedCodeMirrorAppearance(
+        configuration: session.configuration,
+        environmentScheme: colorScheme == .dark ? .dark : .light,
+        systemIncreaseContrast: systemIncreaseContrast,
+        accessibilityReduceMotion: accessibilityReduceMotion,
+        accessibilityReduceTransparency: accessibilityReduceTransparency
       )
-      return session.configuration.withAppearance(appearance)
     }
 
     private var systemIncreaseContrast: Bool {
@@ -177,8 +189,12 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   private var isReady = false
   private var isConfigured = false
   private var pendingCommands: [CodeMirrorHostCommand] = []
+  private var lifecycleID = UUID()
 
   internal var attachedLoadID: UUID? { loadID }
+  internal var pendingCommandCount: Int { pendingCommands.count }
+  internal var pageIsReady: Bool { isReady }
+  internal var pageIsConfigured: Bool { isConfigured }
 
   init(session: CodeMirrorSession, replicaID: CodeMirrorReplicaID) {
     self.session = session
@@ -186,6 +202,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   }
 
   func attach(webView: WKWebView) {
+    lifecycleID = UUID()
     self.webView = webView
     webView.navigationDelegate = self
     webView.uiDelegate = self
@@ -226,7 +243,16 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     guard self.webView === webView else { return }
   }
 
+  func update(appearance: CodeMirrorAppearance) {
+    session?.update(appearance: appearance, for: replicaID)
+  }
+
   func detach() {
+    let detachingLifecycleID = lifecycleID
+    if isReady {
+      evaluate(.invalidate, lifecycleID: detachingLifecycleID)
+    }
+    lifecycleID = UUID()
     if let loadID {
       session?.detach(replicaID: replicaID, loadID: loadID)
     }
@@ -247,7 +273,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   private func send(_ command: CodeMirrorHostCommand) {
     guard webView != nil else { return }
     guard isReady else {
-      pendingCommands.append(command)
+      enqueuePending(command)
       return
     }
     if case .configure = command {
@@ -255,14 +281,77 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       return
     }
     guard isConfigured else {
-      pendingCommands.append(command)
+      enqueuePending(command)
       return
     }
     evaluate(command)
   }
 
-  private func evaluate(_ command: CodeMirrorHostCommand) {
+  private func enqueuePending(_ command: CodeMirrorHostCommand) {
+    switch command {
+    case .configure:
+      replacePending(
+        where: { command in
+          if case .configure = command { return true }
+          return false
+        }, with: command)
+    case .updateConfiguration:
+      replacePending(
+        where: { command in
+          if case .updateConfiguration = command { return true }
+          return false
+        }, with: command)
+    case .apply, .reconcile:
+      replacePending(
+        where: { command in
+          switch command {
+          case .apply, .reconcile: return true
+          default: return false
+          }
+        }, with: command)
+    case .acknowledge:
+      replacePending(
+        where: { command in
+          if case .acknowledge = command { return true }
+          return false
+        }, with: command)
+    case .selection:
+      replacePending(
+        where: { command in
+          if case .selection = command { return true }
+          return false
+        }, with: command)
+    case .focus:
+      replacePending(
+        where: { command in
+          if case .focus = command { return true }
+          return false
+        }, with: command)
+    case .showFind:
+      replacePending(
+        where: { command in
+          if case .showFind = command { return true }
+          return false
+        }, with: command)
+    case .format, .flush, .invalidate:
+      pendingCommands.append(command)
+    }
+  }
+
+  private func replacePending(
+    where matches: (CodeMirrorHostCommand) -> Bool,
+    with command: CodeMirrorHostCommand
+  ) {
+    if let index = pendingCommands.lastIndex(where: matches) {
+      pendingCommands[index] = command
+    } else {
+      pendingCommands.append(command)
+    }
+  }
+
+  private func evaluate(_ command: CodeMirrorHostCommand, lifecycleID: UUID? = nil) {
     guard let webView else { return }
+    let commandLifecycleID = lifecycleID ?? self.lifecycleID
     webView.callAsyncJavaScript(
       "CodeMirrorHost.receive(command)",
       arguments: ["command": command.payload],
@@ -271,7 +360,8 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     ) { [weak self] result in
       guard case .failure = result else { return }
       Task { @MainActor [weak self] in
-        self?.transportFailed()
+        guard let self, self.lifecycleID == commandLifecycleID else { return }
+        self.transportFailed()
       }
     }
   }
@@ -377,7 +467,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
         isConfigured = true
         let queued = pendingCommands
         pendingCommands.removeAll()
-        queued.forEach(evaluate)
+        for command in queued {
+          evaluate(command)
+        }
       }
     } catch {
       transportFailed()

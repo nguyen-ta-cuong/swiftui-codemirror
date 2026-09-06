@@ -187,6 +187,12 @@ test("the packaged page is local-only and exposes the built host transport", asy
   assert.doesNotMatch(html, /<script>\s*CodeMirrorHost\.start/);
   assert.match(html, /cm-host-diagnostics/);
   assert.match(html, /user-select: text/);
+  assert.match(html, /display: flex; flex-direction: column/);
+  assert.match(html, /\.cm-editor \{ order: 1; flex: 1 1 auto; min-height: 0;/);
+  assert.match(html, /\.cm-host-diagnostics \{\s*order: 2;/);
+  assert.doesNotMatch(html, /\.cm-host-diagnostics \{[^}]*position: absolute/s);
+  assert.match(html, /color-scheme: light dark/);
+  assert.match(html, /cm-host-reduce-transparency/);
   assert.match(bundle, /CodeMirrorHost/);
   assert.match(bundle, /cm-host-diagnostics/);
   assert.match(bundle, /fully editable/);
@@ -306,5 +312,43 @@ test("divergent replicas fail flush while retaining recovery state", () => {
   });
   assert.equal(controller.divergent, true);
   assert.equal(harness.text, "local text");
+  controller.destroy();
+});
+
+test("programmatic apply preserves input that arrives after an acknowledged flush", () => {
+  const harness = makeController("one");
+  const { controller, messages } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.hostText = "one";
+  controller.hostRevision = 0;
+  controller.localRevision = 0;
+
+  applyLocalChange(controller, { changes: { from: 3, insert: "!" } });
+  controller.flush("before-undo");
+  controller.acknowledge(1);
+  assert.deepEqual(messages.at(-1), {
+    type: "flushResult",
+    requestID: "before-undo",
+    success: true,
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+
+  applyLocalChange(controller, { changes: { from: 4, insert: "?" } });
+  controller.receive({ type: "apply", revision: 1, text: "one", selections: [] });
+  assert.equal(harness.text, "one!?");
+  assert.equal(controller.divergent, true);
+  controller.flush("after-undo");
+  assert.deepEqual(messages.at(-1), {
+    type: "flushResult",
+    requestID: "after-undo",
+    success: false,
+    code: "conflictingEdit",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
   controller.destroy();
 });

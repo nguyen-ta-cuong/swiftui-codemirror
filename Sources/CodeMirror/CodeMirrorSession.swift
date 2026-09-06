@@ -338,6 +338,8 @@ public final class CodeMirrorSession {
   private var acceptedRevisions: [CodeMirrorReplicaID: Set<UInt64>] = [:]
   private var pendingFlushes: [UUID: PendingFlush] = [:]
   private var pendingFormats: [UUID: PendingFormat] = [:]
+  private var replicaAppearances: [CodeMirrorReplicaID: CodeMirrorAppearance] = [:]
+  private var lastSentConfigurations: [CodeMirrorReplicaID: CodeMirrorConfiguration] = [:]
   private var isInvalidated = false
   private let onEvent: @MainActor (CodeMirrorEvent) -> CodeMirrorEventDisposition
 
@@ -395,9 +397,15 @@ public final class CodeMirrorSession {
   public func update(configuration: CodeMirrorConfiguration) {
     guard !isInvalidated else { return }
     self.configuration = configuration.normalized
-    for replica in replicas.values {
-      replica.send(.updateConfiguration(self.configuration))
+    for replicaID in replicas.keys {
+      sendConfigurationIfChanged(for: replicaID)
     }
+  }
+
+  internal func update(appearance: CodeMirrorAppearance, for replicaID: CodeMirrorReplicaID) {
+    guard !isInvalidated, replicas[replicaID] != nil else { return }
+    replicaAppearances[replicaID] = appearance
+    sendConfigurationIfChanged(for: replicaID)
   }
 
   public func snapshot() throws -> CodeMirrorSnapshot {
@@ -441,6 +449,20 @@ public final class CodeMirrorSession {
     in replicaID: CodeMirrorReplicaID? = nil
   ) async throws -> CodeMirrorSnapshot {
     await Task.yield()
+    return try replaceImmediately(
+      expectedRevision: expectedRevision,
+      changes: changes,
+      selection: selection,
+      in: replicaID
+    )
+  }
+
+  public func replaceImmediately(
+    expectedRevision: CodeMirrorRevision,
+    changes: [CodeMirrorChange],
+    selection: CodeMirrorSelection? = nil,
+    in replicaID: CodeMirrorReplicaID? = nil
+  ) throws -> CodeMirrorSnapshot {
     guard !isInvalidated else {
       throw CodeMirrorSessionError.invalidated
     }
@@ -530,6 +552,8 @@ public final class CodeMirrorSession {
     }
     pendingFlushes.removeAll()
     pendingFormats.removeAll()
+    replicaAppearances.removeAll()
+    lastSentConfigurations.removeAll()
   }
 
   internal func attach(
@@ -545,6 +569,8 @@ public final class CodeMirrorSession {
       oldReplica.send(.invalidate)
       removeReplicaFromPendingOperations(replicaID)
     }
+    replicaAppearances.removeValue(forKey: replicaID)
+    lastSentConfigurations[replicaID] = configuration
     let loadID = UUID()
     replicas[replicaID] = ReplicaConnection(
       loadID: loadID, send: send, isFocused: isFocused, traverseFocus: traverseFocus)
@@ -554,6 +580,8 @@ public final class CodeMirrorSession {
   internal func detach(replicaID: CodeMirrorReplicaID, loadID: UUID) {
     guard replicas[replicaID]?.loadID == loadID else { return }
     replicas.removeValue(forKey: replicaID)
+    replicaAppearances.removeValue(forKey: replicaID)
+    lastSentConfigurations.removeValue(forKey: replicaID)
     removeReplicaFromPendingOperations(replicaID)
   }
 
@@ -612,9 +640,11 @@ public final class CodeMirrorSession {
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID
   ) {
     guard sessionID == id, matches(replicaID: replicaID, loadID: loadID) else { return }
+    let effectiveConfiguration = effectiveConfiguration(for: replicaID)
+    lastSentConfigurations[replicaID] = effectiveConfiguration
     replicas[replicaID]?.send(
       .configure(
-        configuration: configuration,
+        configuration: effectiveConfiguration,
         snapshot: currentSnapshot,
         replicaID: replicaID,
         loadID: loadID
@@ -853,6 +883,9 @@ public final class CodeMirrorSession {
     in replicaID: CodeMirrorReplicaID?,
     broadcast: Bool = true
   ) throws -> CodeMirrorSnapshot {
+    if let replicaID {
+      _ = try replica(replicaID)
+    }
     let resolved = try resolve(changes, against: sourceText)
     let newText = applying(resolved, to: sourceText)
     if let selection, !isValid(selection: selection, in: newText) {
@@ -870,6 +903,21 @@ public final class CodeMirrorSession {
       }
     }
     return snapshot
+  }
+
+  private func effectiveConfiguration(for replicaID: CodeMirrorReplicaID)
+    -> CodeMirrorConfiguration
+  {
+    guard let appearance = replicaAppearances[replicaID] else { return configuration }
+    return configuration.withAppearance(appearance)
+  }
+
+  private func sendConfigurationIfChanged(for replicaID: CodeMirrorReplicaID) {
+    guard let replica = replicas[replicaID] else { return }
+    let effectiveConfiguration = effectiveConfiguration(for: replicaID)
+    guard lastSentConfigurations[replicaID] != effectiveConfiguration else { return }
+    lastSentConfigurations[replicaID] = effectiveConfiguration
+    replica.send(.updateConfiguration(effectiveConfiguration))
   }
 
   private func resolve(_ changes: [CodeMirrorChange], against text: String) throws
@@ -963,11 +1011,19 @@ public final class CodeMirrorSession {
   private func normalizedSelection(_ selection: CodeMirrorSelection, in text: String)
     -> CodeMirrorSelection
   {
-    let limit = text.utf16.count
     return CodeMirrorSelection(
-      anchorUTF16: min(max(selection.anchorUTF16, 0), limit),
-      headUTF16: min(max(selection.headUTF16, 0), limit)
+      anchorUTF16: normalizedUTF16Offset(selection.anchorUTF16, in: text),
+      headUTF16: normalizedUTF16Offset(selection.headUTF16, in: text)
     )
+  }
+
+  private func normalizedUTF16Offset(_ offset: Int, in text: String) -> Int {
+    let limit = text.utf16.count
+    var normalized = min(max(offset, 0), limit)
+    while normalized > 0 && !validUTF16Offset(normalized, in: text) {
+      normalized -= 1
+    }
+    return normalized
   }
 
   private func text(in range: Range<Int>, from text: String) -> String {
@@ -1019,12 +1075,10 @@ public final class CodeMirrorSession {
     let flushRequestIDs = Array(pendingFlushes.keys)
     for requestID in flushRequestIDs {
       guard let pending = pendingFlushes[requestID] else { continue }
-      pending.waitingFor.remove(replicaID)
-      if pending.waitingFor.isEmpty {
-        pendingFlushes.removeValue(forKey: requestID)
-        pending.timeoutTask?.cancel()
-        pending.continuation.resume(returning: currentSnapshot)
-      }
+      guard pending.waitingFor.contains(replicaID) else { continue }
+      pendingFlushes.removeValue(forKey: requestID)
+      pending.timeoutTask?.cancel()
+      pending.continuation.resume(throwing: CodeMirrorSessionError.replicaUnavailable)
     }
     let formatRequestIDs = Array(pendingFormats.keys)
     for requestID in formatRequestIDs {
