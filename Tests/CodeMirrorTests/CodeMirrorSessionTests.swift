@@ -91,6 +91,56 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertEqual(try session.snapshot().text, "source")
   }
 
+  func testMalformedWireRangesFailBeforeConstructionAndDoNotMutateSession() throws {
+    var errors: [CodeMirrorSessionError] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      if case .failure(_, let error) = event {
+        errors.append(error)
+      }
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(replicaID: replicaID, isFocused: { false }, send: { _ in })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+
+    func body(from: Int, to: Int) -> [String: Any] {
+      [
+        "type": "transaction",
+        "sessionID": session.id.rawValue.uuidString,
+        "replicaID": replicaID.rawValue.uuidString,
+        "loadID": loadID.uuidString,
+        "baseRevision": 0,
+        "revision": 1,
+        "changes": [
+          [
+            "fromUTF16": from,
+            "toUTF16": to,
+            "insertedText": "x",
+            "removedText": "",
+          ]
+        ],
+        "selectionBefore": ["anchorUTF16": 0, "headUTF16": 0],
+        "selectionAfter": ["anchorUTF16": 1, "headUTF16": 1],
+      ]
+    }
+
+    for invalidRange in [(2, 1), (-1, 0)] {
+      XCTAssertThrowsError(
+        try CodeMirrorInboundMessage.decode(
+          body(from: invalidRange.0, to: invalidRange.1))
+      ) { error in
+        XCTAssertEqual(error as? CodeMirrorSessionError, .malformedChange)
+      }
+    }
+
+    let outOfBounds = try CodeMirrorInboundMessage.decode(body(from: 0, to: 99))
+    session.receive(outOfBounds)
+
+    XCTAssertEqual(errors, [.malformedChange])
+    XCTAssertEqual(try session.snapshot().text, "source")
+    XCTAssertEqual(try session.snapshot().revision, .zero)
+  }
+
   func testReadyEventWaitsForConfiguredContentHandshake() throws {
     var events: [CodeMirrorEvent] = []
     let session = CodeMirrorSession(initialText: "initial") { event in
@@ -613,6 +663,85 @@ final class CodeMirrorSessionTests: XCTestCase {
   #endif
 
   #if os(macOS) && canImport(AppKit) && canImport(WebKit)
+    func testStalledReadyTimesOutRequiredCommandsWithoutRetainingQueuedFormats() async throws {
+      let session = CodeMirrorSession(
+        initialText: "{\"value\": 1}",
+        configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 1)
+      ) { _ in .accept }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+      defer { coordinator.detach() }
+
+      do {
+        _ = try await session.format(in: replicaID)
+        XCTFail("format unexpectedly succeeded before the page became ready")
+      } catch {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .timeout)
+      }
+      XCTAssertEqual(coordinator.pendingFormatCommandCount, 0)
+
+      for index in 0..<40 {
+        do {
+          if index.isMultiple(of: 2) {
+            _ = try await session.format(in: replicaID)
+          } else {
+            _ = try await session.flush()
+          }
+          XCTFail("required operation unexpectedly succeeded before the page became ready")
+        } catch {
+          XCTAssertEqual(error as? CodeMirrorSessionError, .timeout)
+        }
+      }
+      XCTAssertLessThanOrEqual(coordinator.pendingRequiredCommandCount, 32)
+    }
+
+    func testStalledReadyRejectsRequiredQueueOverflowWithRecoverableFailures() async throws {
+      let session = CodeMirrorSession(
+        initialText: "{\"value\": 1}",
+        configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 5_000)
+      ) { _ in .accept }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+
+      let tasks = (0..<40).map { _ in
+        Task { @MainActor in
+          do {
+            return Result<CodeMirrorSnapshot, CodeMirrorSessionError>.success(
+              try await session.format(in: replicaID))
+          } catch let error as CodeMirrorSessionError {
+            return Result<CodeMirrorSnapshot, CodeMirrorSessionError>.failure(error)
+          } catch {
+            return Result<CodeMirrorSnapshot, CodeMirrorSessionError>.failure(.transportFailure)
+          }
+        }
+      }
+      for _ in 0..<20 {
+        await Task.yield()
+      }
+      XCTAssertLessThanOrEqual(coordinator.pendingRequiredCommandCount, 32)
+      coordinator.detach()
+
+      var results: [Result<CodeMirrorSnapshot, CodeMirrorSessionError>] = []
+      for task in tasks {
+        results.append(await task.value)
+      }
+      XCTAssertEqual(results.count, 40)
+      XCTAssertTrue(
+        results.contains { result in
+          if case .failure(.transportFailure) = result { return true }
+          return false
+        })
+      XCTAssertTrue(
+        results.allSatisfy { result in
+          if case .failure = result { return true }
+          return false
+        })
+    }
+
     func testCoordinatorCoalescesPreReadyCommandsAndRetainsFlushFormat() async throws {
       let session = CodeMirrorSession(initialText: "source") { _ in .accept }
       let replicaID = CodeMirrorReplicaID()

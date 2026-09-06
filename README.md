@@ -42,11 +42,11 @@ npm test
 npm run build
 ```
 
-The build writes the reproducible bundle to `Sources/CodeMirror/web.bundle/codemirror.bundle.js`. Run `npm run generate-notices` after dependency changes; it deterministically regenerates `Sources/CodeMirror/web.bundle/THIRD-PARTY-NOTICES.md` from the committed lockfile, including each transitive package's version, license, source, and integrity metadata. The HTML page uses a non-networking local-only CSP and the native wrapper uses a nonpersistent WebKit data store. No application source or body text is interpolated into JavaScript source.
+The build writes the reproducible bundle to `Sources/CodeMirror/web.bundle/codemirror.bundle.js`. Run `npm run generate-notices` after dependency changes; it deterministically walks the entry-point imports, verifies each bundled runtime package against the committed lockfile, and copies its installed license/notice text into `Sources/CodeMirror/web.bundle/THIRD-PARTY-NOTICES.md`. The notice inventory also lists locked build-only and optional packages separately, without treating their metadata as runtime notices. The HTML page uses a non-networking local-only CSP and the native wrapper uses a nonpersistent WebKit data store. No application source or body text is interpolated into JavaScript source.
 
 ## Provenance
 
-This fork is based on `jaywcjlove/swiftui-codemirror` v2.8.3 and retains the upstream acknowledgments and MIT license. CodeMirror 6 language support is provided by the CodeMirror project, `cm6-graphql` from GraphiQL, and the packages recorded in `codemirrorjs/package-lock.json`. The generated notice file is the committed provenance record for those transitive dependencies; its header records the lockfile hash used to produce it.
+This fork is based on `jaywcjlove/swiftui-codemirror` v2.8.3 and retains the upstream acknowledgments and MIT license. CodeMirror 6 language support is provided by the CodeMirror project, `cm6-graphql` from GraphiQL, and the packages recorded in `codemirrorjs/package-lock.json`. The generated notice file is the committed provenance record for bundled runtime dependencies and the complete locked-package inventory; its header records the lockfile hash used to produce it.
 
 ## Acknowledgments
 

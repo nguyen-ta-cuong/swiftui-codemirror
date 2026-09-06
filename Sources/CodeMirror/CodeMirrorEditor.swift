@@ -180,6 +180,7 @@ internal func resolvedCodeMirrorAppearance(
 @MainActor
 internal final class CodeMirrorEditorCoordinator: NSObject {
   static let messageHandlerName = "codeMirrorHost"
+  private static let maximumPendingRequiredCommands = 32
 
   private weak var webView: WKWebView?
   private weak var session: CodeMirrorSession?
@@ -193,6 +194,17 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
 
   internal var attachedLoadID: UUID? { loadID }
   internal var pendingCommandCount: Int { pendingCommands.count }
+  internal var pendingRequiredCommandCount: Int {
+    pendingCommands.reduce(into: 0) { count, command in
+      if case .format = command { count += 1 }
+      if case .flush = command { count += 1 }
+    }
+  }
+  internal var pendingFormatCommandCount: Int {
+    pendingCommands.reduce(into: 0) { count, command in
+      if case .format = command { count += 1 }
+    }
+  }
   internal var pageIsReady: Bool { isReady }
   internal var pageIsConfigured: Bool { isConfigured }
 
@@ -217,6 +229,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
         },
         traverseFocus: { [weak self] forward in
           self?.traverseNativeFocus(forward: forward)
+        },
+        operationDidFinish: { [weak self] command in
+          self?.removePendingOperation(command)
         }
       )
     } catch let error as CodeMirrorSessionError {
@@ -273,7 +288,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   private func send(_ command: CodeMirrorHostCommand) {
     guard webView != nil else { return }
     guard isReady else {
-      enqueuePending(command)
+      if !enqueuePending(command) {
+        session?.failQueuedOperation(command)
+      }
       return
     }
     if case .configure = command {
@@ -281,13 +298,16 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       return
     }
     guard isConfigured else {
-      enqueuePending(command)
+      if !enqueuePending(command) {
+        session?.failQueuedOperation(command)
+      }
       return
     }
     evaluate(command)
   }
 
-  private func enqueuePending(_ command: CodeMirrorHostCommand) {
+  @discardableResult
+  private func enqueuePending(_ command: CodeMirrorHostCommand) -> Bool {
     switch command {
     case .configure:
       replacePending(
@@ -333,8 +353,39 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
           if case .showFind = command { return true }
           return false
         }, with: command)
-    case .format, .flush, .invalidate:
+    case .format, .flush:
+      guard pendingRequiredCommandCount < Self.maximumPendingRequiredCommands else {
+        return false
+      }
       pendingCommands.append(command)
+    case .invalidate:
+      replacePending(
+        where: { command in
+          if case .invalidate = command { return true }
+          return false
+        }, with: command)
+    }
+    return true
+  }
+
+  private func removePendingOperation(_ command: CodeMirrorHostCommand) {
+    switch command {
+    case .format(let requestID):
+      pendingCommands.removeAll { command in
+        if case .format(let queuedRequestID) = command {
+          return queuedRequestID == requestID
+        }
+        return false
+      }
+    case .flush(let requestID):
+      pendingCommands.removeAll { command in
+        if case .flush(let queuedRequestID) = command {
+          return queuedRequestID == requestID
+        }
+        return false
+      }
+    default:
+      break
     }
   }
 
@@ -468,6 +519,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
         let queued = pendingCommands
         pendingCommands.removeAll()
         for command in queued {
+          guard session?.hasPendingOperation(command) != false else { continue }
           evaluate(command)
         }
       }

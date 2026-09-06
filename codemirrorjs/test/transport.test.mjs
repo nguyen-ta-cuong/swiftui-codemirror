@@ -200,6 +200,20 @@ test("the packaged page is local-only and exposes the built host transport", asy
   assert.match(bundle, /Ctrl-Tab/);
 });
 
+test("runtime notices retain installed permission text and classify non-bundled locks", async () => {
+  const notices = await readFile(
+    new URL("../../Sources/CodeMirror/web.bundle/THIRD-PARTY-NOTICES.md", import.meta.url),
+    "utf8"
+  );
+  assert.match(notices, /Bundled runtime package count: [1-9]\d*/);
+  assert.match(notices, /### @codemirror\/state@/);
+  assert.match(notices, /### graphql@/);
+  assert.match(notices, /Copyright/);
+  assert.match(notices, /Permission is hereby granted/);
+  assert.match(notices, /not-bundled/);
+  assert.doesNotMatch(notices, /89 package notice compliance/);
+});
+
 test("post messages carry the active native identity after configuration", () => {
   const messages = [];
   const controller = new EditorController(message => messages.push(message), { body: null });

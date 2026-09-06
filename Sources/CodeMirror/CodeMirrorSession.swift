@@ -164,11 +164,20 @@ private struct WireMessage: Codable {
   }
 
   private func transaction() throws -> CodeMirrorTransaction {
-    let changes = try changes.required().map {
-      CodeMirrorChange(
-        rangeUTF16: $0.fromUTF16..<$0.toUTF16,
-        insertedText: $0.insertedText,
-        removedText: $0.removedText
+    let wireChanges = try changes.required()
+    var previousEnd = 0
+    let changes = try wireChanges.map { wireChange in
+      guard wireChange.fromUTF16 >= 0,
+        wireChange.toUTF16 >= wireChange.fromUTF16,
+        wireChange.fromUTF16 >= previousEnd
+      else {
+        throw CodeMirrorSessionError.malformedChange
+      }
+      previousEnd = wireChange.toUTF16
+      return CodeMirrorChange(
+        rangeUTF16: wireChange.fromUTF16..<wireChange.toUTF16,
+        insertedText: wireChange.insertedText,
+        removedText: wireChange.removedText
       )
     }
     let composition = try decodeComposition(composition)
@@ -348,6 +357,7 @@ public final class CodeMirrorSession {
     let send: @MainActor (CodeMirrorHostCommand) -> Void
     let isFocused: @MainActor () -> Bool
     let traverseFocus: @MainActor (Bool) -> Void
+    let operationDidFinish: @MainActor (CodeMirrorHostCommand) -> Void
   }
 
   @MainActor
@@ -437,6 +447,7 @@ public final class CodeMirrorSession {
       }
       pendingFlushes[requestID] = pending
       for replicaID in replicaIDs {
+        guard pendingFlushes[requestID] != nil else { break }
         replicas[replicaID]?.send(.flush(requestID: requestID))
       }
     }
@@ -541,17 +552,13 @@ public final class CodeMirrorSession {
     for replica in replicas.values {
       replica.send(.invalidate)
     }
+    for requestID in Array(pendingFlushes.keys) {
+      finishPendingFlush(requestID, with: .invalidated)
+    }
+    for requestID in Array(pendingFormats.keys) {
+      finishPendingFormat(requestID, with: .invalidated)
+    }
     replicas.removeAll()
-    for pending in pendingFlushes.values {
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: CodeMirrorSessionError.invalidated)
-    }
-    for pending in pendingFormats.values {
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: CodeMirrorSessionError.invalidated)
-    }
-    pendingFlushes.removeAll()
-    pendingFormats.removeAll()
     replicaAppearances.removeAll()
     lastSentConfigurations.removeAll()
   }
@@ -560,29 +567,32 @@ public final class CodeMirrorSession {
     replicaID: CodeMirrorReplicaID,
     isFocused: @escaping @MainActor () -> Bool,
     send: @escaping @MainActor (CodeMirrorHostCommand) -> Void,
-    traverseFocus: @escaping @MainActor (Bool) -> Void = { _ in }
+    traverseFocus: @escaping @MainActor (Bool) -> Void = { _ in },
+    operationDidFinish: @escaping @MainActor (CodeMirrorHostCommand) -> Void = { _ in }
   ) throws -> UUID {
     guard !isInvalidated else {
       throw CodeMirrorSessionError.invalidated
     }
-    if let oldReplica = replicas.removeValue(forKey: replicaID) {
+    if let oldReplica = replicas[replicaID] {
       oldReplica.send(.invalidate)
       removeReplicaFromPendingOperations(replicaID)
+      replicas.removeValue(forKey: replicaID)
     }
     replicaAppearances.removeValue(forKey: replicaID)
     lastSentConfigurations[replicaID] = configuration
     let loadID = UUID()
     replicas[replicaID] = ReplicaConnection(
-      loadID: loadID, send: send, isFocused: isFocused, traverseFocus: traverseFocus)
+      loadID: loadID, send: send, isFocused: isFocused, traverseFocus: traverseFocus,
+      operationDidFinish: operationDidFinish)
     return loadID
   }
 
   internal func detach(replicaID: CodeMirrorReplicaID, loadID: UUID) {
     guard replicas[replicaID]?.loadID == loadID else { return }
+    removeReplicaFromPendingOperations(replicaID)
     replicas.removeValue(forKey: replicaID)
     replicaAppearances.removeValue(forKey: replicaID)
     lastSentConfigurations.removeValue(forKey: replicaID)
-    removeReplicaFromPendingOperations(replicaID)
   }
 
   internal func receive(_ message: CodeMirrorInboundMessage) {
@@ -625,6 +635,28 @@ public final class CodeMirrorSession {
     guard matches(replicaID: replicaID, loadID: loadID) else { return }
     publishFailure(replicaID: replicaID, error: .transportFailure)
     failOperations(for: replicaID, with: .transportFailure)
+  }
+
+  internal func hasPendingOperation(_ command: CodeMirrorHostCommand) -> Bool {
+    switch command {
+    case .format(let requestID):
+      return pendingFormats[requestID] != nil
+    case .flush(let requestID):
+      return pendingFlushes[requestID] != nil
+    default:
+      return true
+    }
+  }
+
+  internal func failQueuedOperation(_ command: CodeMirrorHostCommand) {
+    switch command {
+    case .format(let requestID):
+      finishPendingFormat(requestID, with: .transportFailure)
+    case .flush(let requestID):
+      finishPendingFlush(requestID, with: .transportFailure)
+    default:
+      break
+    }
   }
 
   private var currentSnapshot: CodeMirrorSnapshot {
@@ -768,6 +800,7 @@ public final class CodeMirrorSession {
       return
     }
     pending.timeoutTask?.cancel()
+    replicas[pending.replicaID]?.operationDidFinish(.format(requestID: requestID))
     if success {
       pending.continuation.resume(returning: currentSnapshot)
     } else {
@@ -789,12 +822,14 @@ public final class CodeMirrorSession {
       return
     }
     guard success else {
-      pendingFlushes.removeValue(forKey: requestID)
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: code.map(sessionError(for:)) ?? .compositionInProgress)
+      finishPendingFlush(
+        requestID,
+        with: code.map(sessionError(for:)) ?? .compositionInProgress
+      )
       return
     }
     pending.waitingFor.remove(replicaID)
+    replicas[replicaID]?.operationDidFinish(.flush(requestID: requestID))
     guard pending.waitingFor.isEmpty else { return }
     pendingFlushes.removeValue(forKey: requestID)
     pending.timeoutTask?.cancel()
@@ -1062,13 +1097,27 @@ public final class CodeMirrorSession {
   }
 
   private func timeoutFlush(_ requestID: UUID) {
-    guard let pending = pendingFlushes.removeValue(forKey: requestID) else { return }
-    pending.continuation.resume(throwing: CodeMirrorSessionError.timeout)
+    finishPendingFlush(requestID, with: .timeout)
   }
 
   private func timeoutFormat(_ requestID: UUID) {
+    finishPendingFormat(requestID, with: .timeout)
+  }
+
+  private func finishPendingFlush(_ requestID: UUID, with error: CodeMirrorSessionError) {
+    guard let pending = pendingFlushes.removeValue(forKey: requestID) else { return }
+    pending.timeoutTask?.cancel()
+    for replicaID in pending.waitingFor {
+      replicas[replicaID]?.operationDidFinish(.flush(requestID: requestID))
+    }
+    pending.continuation.resume(throwing: error)
+  }
+
+  private func finishPendingFormat(_ requestID: UUID, with error: CodeMirrorSessionError) {
     guard let pending = pendingFormats.removeValue(forKey: requestID) else { return }
-    pending.continuation.resume(throwing: CodeMirrorSessionError.timeout)
+    pending.timeoutTask?.cancel()
+    replicas[pending.replicaID]?.operationDidFinish(.format(requestID: requestID))
+    pending.continuation.resume(throwing: error)
   }
 
   private func removeReplicaFromPendingOperations(_ replicaID: CodeMirrorReplicaID) {
@@ -1076,18 +1125,14 @@ public final class CodeMirrorSession {
     for requestID in flushRequestIDs {
       guard let pending = pendingFlushes[requestID] else { continue }
       guard pending.waitingFor.contains(replicaID) else { continue }
-      pendingFlushes.removeValue(forKey: requestID)
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: CodeMirrorSessionError.replicaUnavailable)
+      finishPendingFlush(requestID, with: .replicaUnavailable)
     }
     let formatRequestIDs = Array(pendingFormats.keys)
     for requestID in formatRequestIDs {
       guard let pending = pendingFormats[requestID], pending.replicaID == replicaID else {
         continue
       }
-      pendingFormats.removeValue(forKey: requestID)
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: CodeMirrorSessionError.replicaUnavailable)
+      finishPendingFormat(requestID, with: .replicaUnavailable)
     }
   }
 
@@ -1099,18 +1144,14 @@ public final class CodeMirrorSession {
       guard let pending = pendingFlushes[requestID], pending.waitingFor.contains(replicaID) else {
         continue
       }
-      pendingFlushes.removeValue(forKey: requestID)
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: error)
+      finishPendingFlush(requestID, with: error)
     }
     let formatRequestIDs = Array(pendingFormats.keys)
     for requestID in formatRequestIDs {
       guard let pending = pendingFormats[requestID], pending.replicaID == replicaID else {
         continue
       }
-      pendingFormats.removeValue(forKey: requestID)
-      pending.timeoutTask?.cancel()
-      pending.continuation.resume(throwing: error)
+      finishPendingFormat(requestID, with: error)
     }
   }
 }

@@ -27,8 +27,10 @@ final class HostedFocusTests: XCTestCase {
       session: session, replicaID: inlineReplicaID)
     let detachedCoordinator = CodeMirrorEditorCoordinator(
       session: session, replicaID: detachedReplicaID)
-    let inlineWebView = WKWebView(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
-    let detachedWebView = WKWebView(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+    let inlineWebView = makeWebView(
+      for: inlineCoordinator, frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+    let detachedWebView = makeWebView(
+      for: detachedCoordinator, frame: NSRect(x: 0, y: 0, width: 640, height: 420))
     let precedingField = NSTextField(frame: NSRect(x: 12, y: 12, width: 220, height: 24))
     let followingField = NSTextField(frame: NSRect(x: 12, y: 48, width: 220, height: 24))
     precedingField.stringValue = "Before editor"
@@ -263,6 +265,18 @@ final class HostedFocusTests: XCTestCase {
 
   private func isFirstResponder(of field: NSTextField, in window: NSWindow) -> Bool {
     window.firstResponder === field || window.firstResponder === field.currentEditor()
+  }
+
+  private func makeWebView(
+    for coordinator: CodeMirrorEditorCoordinator, frame: NSRect
+  ) -> WKWebView {
+    let contentController = WKUserContentController()
+    contentController.add(coordinator, name: CodeMirrorEditorCoordinator.messageHandlerName)
+    let configuration = WKWebViewConfiguration()
+    configuration.websiteDataStore = .nonPersistent()
+    configuration.userContentController = contentController
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+    return WKWebView(frame: frame, configuration: configuration)
   }
 
   private func activate(_ window: NSWindow) {
