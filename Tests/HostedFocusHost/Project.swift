@@ -23,9 +23,12 @@ let project = Project(
         "LSBackgroundOnly": .boolean(false),
         "LSUIElement": .boolean(false),
         "NSHighResolutionCapable": .boolean(true),
-        "NSPrincipalClass": .string("NSApplication"),
+        "NSPrincipalClass": .string("HostedFocusHostApplication"),
       ]),
       sources: ["Sources/**"],
+      dependencies: [
+        .package(product: "CodeMirror")
+      ],
       settings: .settings(base: [
         "CODE_SIGNING_ALLOWED": "NO"
       ])

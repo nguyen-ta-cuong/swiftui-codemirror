@@ -1,9 +1,12 @@
 import AppKit
 
 @main
+@MainActor
 final class HostedFocusHostAppDelegate: NSObject, NSApplicationDelegate {
+  @objc dynamic private(set) var didFinishLaunching = false
+
   static func main() {
-    let application = NSApplication.shared
+    let application = HostedFocusHostApplication.shared
     let delegate = HostedFocusHostAppDelegate()
     application.delegate = delegate
     _ = application.setActivationPolicy(.regular)
@@ -15,6 +18,7 @@ final class HostedFocusHostAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    didFinishLaunching = true
     NSApp.setActivationPolicy(.regular)
     NSApp.activate(ignoringOtherApps: true)
   }

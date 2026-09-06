@@ -31,6 +31,16 @@ Use `flush()` before saving, exporting, running, navigating, or tearing down an 
 
 The supported language values are `.text`, `.json`, `.xml`, and `.graphql`. JSON formatting is lexical: it preserves number lexemes, key order, duplicate keys, and string escapes. Documents larger than 1 MiB remain editable in plain mode while syntax analysis and formatting report unavailable.
 
+## Native editing commands
+
+`focusedReplicaID()` includes embedded Find focus and is the native focus/Find routing query. `focusedEditorContentReplicaID()` is a conservative menu-presentation query; its cached DOM scope does not authorize Undo/Redo execution.
+
+For nil-target Undo/Redo, the host uses a weak per-window registration and fixed replica. After target resolution it revalidates native key-window and replica ownership plus real `UndoManager` availability, then awaits `routeCommand(_:in:)`. Native fields and ordinary Find retain normal responder-chain fallthrough.
+
+`forwardedToHost` emits exactly one existing `CodeMirrorEvent.command`. The host sends that event through flush-before-Undo preparation and the shared document `UndoManager`; it must not perform a second Undo/Redo from the result. `handledByEmbeddedControl` performs only local Find history and emits no document command; `unavailable` emits none.
+
+Inline and detached editors share their owning document session and `UndoManager`; another document owns a separate manager. Use `replaceImmediately` inside synchronous Undo callbacks and register inverses before the callback returns.
+
 ## Local bundle development
 
 The JavaScript source and lockfile live in `codemirrorjs`.

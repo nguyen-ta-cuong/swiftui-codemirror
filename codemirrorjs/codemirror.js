@@ -517,6 +517,10 @@ class EditorController {
     this.foldCompartment = new Compartment();
     this.listenerCompartment = new Compartment();
     this.handlers = [];
+    this.focusHandlers = [];
+    this.focusReportTimer = null;
+    this.focusSequence = 0;
+    this.reportedFocusScope = null;
   }
 
   mount() {
@@ -573,6 +577,7 @@ class EditorController {
     });
     this.view.dom.setAttribute("aria-busy", "true");
     this.installCompositionHandlers();
+    this.installFocusHandlers();
     this.post({ type: "ready" });
   }
 
@@ -615,7 +620,11 @@ class EditorController {
     case "showFind":
       if (this.view) {
         openSearchPanel(this.view);
+        this.scheduleFocusReport();
       }
+      break;
+    case "routeCommand":
+      this.routeCommand(command.requestID, command.command);
       break;
     case "format":
       this.format(command.requestID);
@@ -644,6 +653,8 @@ class EditorController {
     this.hostRevision = Number(command.revision);
     this.localRevision = this.hostRevision;
     this.configuration = command.configuration;
+    this.focusSequence = 0;
+    this.reportedFocusScope = null;
     this.updateConfiguration(this.configuration);
     this.replaceDocument(command.text, command.selections, true);
     this.localEditBeforeConfiguration = false;
@@ -652,6 +663,7 @@ class EditorController {
     this.updateConfiguration(this.configuration);
     this.scheduleDiagnostics();
     this.post({ type: "configured" });
+    this.reportFocusScope(true);
   }
 
   updateConfiguration(configuration) {
@@ -896,6 +908,35 @@ class EditorController {
     return true;
   }
 
+  routeCommand(requestID, command) {
+    const scope = this.focusScopeForActiveElement();
+    let result = "unavailable";
+    if (scope === "content") {
+      result = "forwardedToHost";
+    } else if (scope === "embeddedControl") {
+      const input = this.documentRef?.querySelector?.(".cm-search input");
+      if (input && this.documentRef?.activeElement === input) {
+        try {
+          const supported = this.documentRef.queryCommandSupported?.(command) === true;
+          const enabled = supported && this.documentRef.queryCommandEnabled?.(command) === true;
+          const executed = enabled && this.documentRef.execCommand?.(command) === true;
+          if (this.documentRef.activeElement === input && supported && enabled && executed) {
+            result = "handledByEmbeddedControl";
+          }
+        } catch {
+          result = "unavailable";
+        }
+      }
+    }
+    this.post({
+      type: "commandRouteResult",
+      requestID,
+      revision: this.localRevision,
+      command,
+      result
+    });
+  }
+
   sendFocusTraversal(forward) {
     if (!this.configured) {
       return true;
@@ -1005,7 +1046,74 @@ class EditorController {
     }
   }
 
+  installFocusHandlers() {
+    if (!this.documentRef?.addEventListener) {
+      return;
+    }
+    const focusIn = () => this.scheduleFocusReport();
+    const focusOut = () => this.scheduleFocusReport();
+    this.documentRef.addEventListener("focusin", focusIn, true);
+    this.documentRef.addEventListener("focusout", focusOut, true);
+    this.focusHandlers = [
+      ["focusin", focusIn],
+      ["focusout", focusOut]
+    ];
+  }
+
+  scheduleFocusReport() {
+    if (this.focusReportTimer !== null) {
+      return;
+    }
+    this.focusReportTimer = Promise.resolve().then(() => {
+      this.focusReportTimer = null;
+      this.reportFocusScope(false);
+    });
+  }
+
+  focusScopeForActiveElement() {
+    const activeElement = this.documentRef?.activeElement;
+    const content = this.view?.contentDOM ?? this.view?.dom?.querySelector?.(".cm-content");
+    if (activeElement && content && activeElement === content) {
+      return "content";
+    }
+    const findInput = this.documentRef?.querySelector?.(".cm-search input");
+    if (activeElement && findInput && activeElement === findInput) {
+      return "embeddedControl";
+    }
+    return "other";
+  }
+
+  reportFocusScope(force) {
+    if (!this.configured || !this.sessionID || !this.replicaID || !this.loadID) {
+      return;
+    }
+    const scope = this.focusScopeForActiveElement();
+    if (!force && scope === this.reportedFocusScope) {
+      return;
+    }
+    this.reportedFocusScope = scope;
+    this.focusSequence += 1;
+    this.post({
+      type: "focusScope",
+      focusSequence: this.focusSequence,
+      focusScope: scope
+    });
+  }
+
   destroy() {
+    if (this.documentRef?.removeEventListener) {
+      for (const [name, handler] of this.focusHandlers) {
+        this.documentRef.removeEventListener(name, handler, true);
+      }
+    }
+    this.focusHandlers = [];
+    this.focusReportTimer = null;
+    this.reportedFocusScope = null;
+    this.configured = false;
+    this.initializing = true;
+    this.sessionID = null;
+    this.replicaID = null;
+    this.loadID = null;
     if (this.view) {
       for (const [name, handler] of this.handlers) {
         this.view.dom.removeEventListener(name, handler);

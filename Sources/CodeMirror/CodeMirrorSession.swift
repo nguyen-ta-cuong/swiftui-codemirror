@@ -10,6 +10,7 @@ internal enum CodeMirrorHostCommand: Sendable {
   case acknowledge(revision: CodeMirrorRevision)
   case focus
   case showFind
+  case routeCommand(requestID: UUID, command: CodeMirrorCommand)
   case format(requestID: UUID)
   case flush(requestID: UUID)
   case selection(CodeMirrorSelection)
@@ -21,6 +22,9 @@ internal enum CodeMirrorInboundMessage {
   case configured(sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID)
   case focusTraversal(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID, forward: Bool)
+  case focusScope(
+    sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
+    sequence: UInt64, scope: CodeMirrorFocusScope)
   case transaction(CodeMirrorTransaction)
   case selection(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
@@ -28,6 +32,10 @@ internal enum CodeMirrorInboundMessage {
   case command(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
     revision: CodeMirrorRevision, command: CodeMirrorCommand)
+  case commandRouteResult(
+    sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
+    revision: CodeMirrorRevision, requestID: UUID, command: CodeMirrorCommand,
+    result: CodeMirrorCommandRoutingResult)
   case formatResult(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID, requestID: UUID,
     success: Bool)
@@ -45,6 +53,12 @@ internal enum CodeMirrorInboundMessage {
     let message = try JSONDecoder().decode(WireMessage.self, from: data)
     return try message.decodeMessage()
   }
+}
+
+internal enum CodeMirrorFocusScope: String, Equatable, Sendable {
+  case content
+  case embeddedControl
+  case other
 }
 
 private struct WireSelection: Codable {
@@ -82,6 +96,9 @@ private struct WireMessage: Codable {
   let selection: WireSelection?
   let composition: WireComposition?
   let command: String?
+  let focusSequence: UInt64?
+  let focusScope: String?
+  let result: String?
   let direction: String?
   let success: Bool?
   let code: String?
@@ -110,6 +127,17 @@ private struct WireMessage: Codable {
         loadID: try loadID.required().uuid(),
         forward: direction == "next"
       )
+    case "focusScope":
+      guard let focusScope, let scope = CodeMirrorFocusScope(rawValue: focusScope) else {
+        throw CodeMirrorSessionError.transportFailure
+      }
+      return .focusScope(
+        sessionID: try sessionID.required().sessionID(),
+        replicaID: try replicaID.required().replicaID(),
+        loadID: try loadID.required().uuid(),
+        sequence: try focusSequence.required(),
+        scope: scope
+      )
     case "transaction":
       return .transaction(try transaction())
     case "selection":
@@ -130,6 +158,21 @@ private struct WireMessage: Codable {
         loadID: try loadID.required().uuid(),
         revision: CodeMirrorRevision(try revision.required()),
         command: command
+      )
+    case "commandRouteResult":
+      guard let command, let command = CodeMirrorCommand(rawValue: command),
+        let result, let result = CodeMirrorCommandRoutingResult(rawValue: result)
+      else {
+        throw CodeMirrorSessionError.transportFailure
+      }
+      return .commandRouteResult(
+        sessionID: try sessionID.required().sessionID(),
+        replicaID: try replicaID.required().replicaID(),
+        loadID: try loadID.required().uuid(),
+        revision: CodeMirrorRevision(try revision.required()),
+        requestID: try requestID.required().uuid(),
+        command: command,
+        result: result
       )
     case "formatResult":
       return .formatResult(
@@ -286,6 +329,12 @@ extension CodeMirrorHostCommand {
       return ["type": "focus"]
     case .showFind:
       return ["type": "showFind"]
+    case .routeCommand(let requestID, let command):
+      return [
+        "type": "routeCommand",
+        "requestID": requestID.uuidString,
+        "command": command.rawValue,
+      ]
     case .format(let requestID):
       return ["type": "format", "requestID": requestID.uuidString]
     case .flush(let requestID):
@@ -337,6 +386,8 @@ private func selectionPayload(_ selection: CodeMirrorSelection) -> [String: Any]
 
 @MainActor
 public final class CodeMirrorSession {
+  private static let maximumPendingRouteCommands = 32
+
   public let id: CodeMirrorSessionID
   public private(set) var configuration: CodeMirrorConfiguration
 
@@ -347,8 +398,10 @@ public final class CodeMirrorSession {
   private var acceptedRevisions: [CodeMirrorReplicaID: Set<UInt64>] = [:]
   private var pendingFlushes: [UUID: PendingFlush] = [:]
   private var pendingFormats: [UUID: PendingFormat] = [:]
+  private var pendingRouteCommands: [UUID: PendingRouteCommand] = [:]
   private var replicaAppearances: [CodeMirrorReplicaID: CodeMirrorAppearance] = [:]
   private var lastSentConfigurations: [CodeMirrorReplicaID: CodeMirrorConfiguration] = [:]
+  private var focusScopes: [CodeMirrorReplicaID: FocusScopeReport] = [:]
   private var isInvalidated = false
   private let onEvent: @MainActor (CodeMirrorEvent) -> CodeMirrorEventDisposition
 
@@ -358,6 +411,12 @@ public final class CodeMirrorSession {
     let isFocused: @MainActor () -> Bool
     let traverseFocus: @MainActor (Bool) -> Void
     let operationDidFinish: @MainActor (CodeMirrorHostCommand) -> Void
+  }
+
+  private struct FocusScopeReport {
+    let loadID: UUID
+    let sequence: UInt64
+    let scope: CodeMirrorFocusScope
   }
 
   @MainActor
@@ -387,6 +446,30 @@ public final class CodeMirrorSession {
     ) {
       self.continuation = continuation
       self.replicaID = replicaID
+    }
+  }
+
+  @MainActor
+  private final class PendingRouteCommand {
+    let continuation: CheckedContinuation<CodeMirrorCommandRoutingResult, Error>
+    let replicaID: CodeMirrorReplicaID
+    let loadID: UUID
+    let revision: CodeMirrorRevision
+    let command: CodeMirrorCommand
+    var timeoutTask: Task<Void, Never>?
+
+    init(
+      continuation: CheckedContinuation<CodeMirrorCommandRoutingResult, Error>,
+      replicaID: CodeMirrorReplicaID,
+      loadID: UUID,
+      revision: CodeMirrorRevision,
+      command: CodeMirrorCommand
+    ) {
+      self.continuation = continuation
+      self.replicaID = replicaID
+      self.loadID = loadID
+      self.revision = revision
+      self.command = command
     }
   }
 
@@ -428,6 +511,61 @@ public final class CodeMirrorSession {
   public func focusedReplicaID() -> CodeMirrorReplicaID? {
     guard !isInvalidated else { return nil }
     return replicas.first(where: { $0.value.isFocused() })?.key
+  }
+
+  public func focusedEditorContentReplicaID() -> CodeMirrorReplicaID? {
+    guard !isInvalidated else { return nil }
+    return replicas.first { replicaID, replica in
+      replica.isFocused()
+        && focusScopes[replicaID]?.loadID == replica.loadID
+        && focusScopes[replicaID]?.scope == .content
+    }?.key
+  }
+
+  public func routeCommand(
+    _ command: CodeMirrorCommand,
+    in replicaID: CodeMirrorReplicaID
+  ) async throws -> CodeMirrorCommandRoutingResult {
+    await Task.yield()
+    guard !isInvalidated else {
+      throw CodeMirrorSessionError.invalidated
+    }
+    let replica = try replica(replicaID)
+    guard replica.isFocused() else {
+      return .unavailable
+    }
+    guard pendingRouteCommands.count < Self.maximumPendingRouteCommands else {
+      throw CodeMirrorSessionError.timeout
+    }
+    let requestID = UUID()
+    let revision = currentRevision
+    return try await withTaskCancellationHandler(
+      operation: {
+        try await withCheckedThrowingContinuation {
+          (continuation: CheckedContinuation<CodeMirrorCommandRoutingResult, Error>) in
+          guard !Task.isCancelled else {
+            continuation.resume(throwing: CodeMirrorSessionError.timeout)
+            return
+          }
+          let pending = PendingRouteCommand(
+            continuation: continuation,
+            replicaID: replicaID,
+            loadID: replica.loadID,
+            revision: revision,
+            command: command
+          )
+          pending.timeoutTask = timeoutTask { [weak self] in
+            self?.finishPendingRouteCommand(requestID, with: .timeout)
+          }
+          pendingRouteCommands[requestID] = pending
+          replicas[replicaID]?.send(.routeCommand(requestID: requestID, command: command))
+        }
+      },
+      onCancel: { [weak self] in
+        Task { @MainActor in
+          self?.finishPendingRouteCommand(requestID, with: .timeout)
+        }
+      })
   }
 
   public func flush() async throws -> CodeMirrorSnapshot {
@@ -558,9 +696,13 @@ public final class CodeMirrorSession {
     for requestID in Array(pendingFormats.keys) {
       finishPendingFormat(requestID, with: .invalidated)
     }
+    for requestID in Array(pendingRouteCommands.keys) {
+      finishPendingRouteCommand(requestID, with: .invalidated)
+    }
     replicas.removeAll()
     replicaAppearances.removeAll()
     lastSentConfigurations.removeAll()
+    focusScopes.removeAll()
   }
 
   internal func attach(
@@ -579,6 +721,7 @@ public final class CodeMirrorSession {
       replicas.removeValue(forKey: replicaID)
     }
     replicaAppearances.removeValue(forKey: replicaID)
+    focusScopes.removeValue(forKey: replicaID)
     lastSentConfigurations[replicaID] = configuration
     let loadID = UUID()
     replicas[replicaID] = ReplicaConnection(
@@ -593,6 +736,13 @@ public final class CodeMirrorSession {
     replicas.removeValue(forKey: replicaID)
     replicaAppearances.removeValue(forKey: replicaID)
     lastSentConfigurations.removeValue(forKey: replicaID)
+    focusScopes.removeValue(forKey: replicaID)
+  }
+
+  internal func clearFocusScope(replicaID: CodeMirrorReplicaID, loadID: UUID) {
+    guard matches(replicaID: replicaID, loadID: loadID) else { return }
+    focusScopes.removeValue(forKey: replicaID)
+    failRouteCommands(for: replicaID, loadID: loadID, with: .replicaUnavailable)
   }
 
   internal func receive(_ message: CodeMirrorInboundMessage) {
@@ -607,6 +757,10 @@ public final class CodeMirrorSession {
     case .focusTraversal(let sessionID, let replicaID, let loadID, let forward):
       receiveFocusTraversal(
         sessionID: sessionID, replicaID: replicaID, loadID: loadID, forward: forward)
+    case .focusScope(let sessionID, let replicaID, let loadID, let sequence, let scope):
+      receiveFocusScope(
+        sessionID: sessionID, replicaID: replicaID, loadID: loadID, sequence: sequence, scope: scope
+      )
     case .transaction(let transaction):
       receiveTransaction(transaction)
     case .selection(let sessionID, let replicaID, let loadID, let revision, let selection):
@@ -617,6 +771,18 @@ public final class CodeMirrorSession {
       receiveCommand(
         sessionID: sessionID, replicaID: replicaID, loadID: loadID, revision: revision,
         command: command)
+    case .commandRouteResult(
+      let sessionID, let replicaID, let loadID, let revision, let requestID, let command, let result
+    ):
+      receiveCommandRouteResult(
+        sessionID: sessionID,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: revision,
+        requestID: requestID,
+        command: command,
+        result: result
+      )
     case .formatResult(let sessionID, let replicaID, let loadID, let requestID, let success):
       receiveFormatResult(
         sessionID: sessionID, replicaID: replicaID, loadID: loadID, requestID: requestID,
@@ -639,6 +805,8 @@ public final class CodeMirrorSession {
 
   internal func hasPendingOperation(_ command: CodeMirrorHostCommand) -> Bool {
     switch command {
+    case .routeCommand(let requestID, _):
+      return pendingRouteCommands[requestID] != nil
     case .format(let requestID):
       return pendingFormats[requestID] != nil
     case .flush(let requestID):
@@ -650,6 +818,8 @@ public final class CodeMirrorSession {
 
   internal func failQueuedOperation(_ command: CodeMirrorHostCommand) {
     switch command {
+    case .routeCommand(let requestID, _):
+      finishPendingRouteCommand(requestID, with: .transportFailure)
     case .format(let requestID):
       finishPendingFormat(requestID, with: .transportFailure)
     case .flush(let requestID):
@@ -672,6 +842,7 @@ public final class CodeMirrorSession {
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID
   ) {
     guard sessionID == id, matches(replicaID: replicaID, loadID: loadID) else { return }
+    focusScopes.removeValue(forKey: replicaID)
     let effectiveConfiguration = effectiveConfiguration(for: replicaID)
     lastSentConfigurations[replicaID] = effectiveConfiguration
     replicas[replicaID]?.send(
@@ -681,6 +852,22 @@ public final class CodeMirrorSession {
         replicaID: replicaID,
         loadID: loadID
       ))
+  }
+
+  private func receiveFocusScope(
+    sessionID: CodeMirrorSessionID,
+    replicaID: CodeMirrorReplicaID,
+    loadID: UUID,
+    sequence: UInt64,
+    scope: CodeMirrorFocusScope
+  ) {
+    guard sessionID == id, matches(replicaID: replicaID, loadID: loadID) else { return }
+    if let previous = focusScopes[replicaID], previous.loadID == loadID,
+      sequence <= previous.sequence
+    {
+      return
+    }
+    focusScopes[replicaID] = FocusScopeReport(loadID: loadID, sequence: sequence, scope: scope)
   }
 
   private func receiveConfigured(
@@ -785,6 +972,40 @@ public final class CodeMirrorSession {
     if case .invalidate = onEvent(.command(replicaID: replicaID, command: command)) {
       invalidate()
     }
+  }
+
+  private func receiveCommandRouteResult(
+    sessionID: CodeMirrorSessionID,
+    replicaID: CodeMirrorReplicaID,
+    loadID: UUID,
+    revision: CodeMirrorRevision,
+    requestID: UUID,
+    command: CodeMirrorCommand,
+    result: CodeMirrorCommandRoutingResult
+  ) {
+    guard sessionID == id, matches(replicaID: replicaID, loadID: loadID),
+      let pending = pendingRouteCommands.removeValue(forKey: requestID)
+    else {
+      return
+    }
+    pending.timeoutTask?.cancel()
+    replicas[pending.replicaID]?.operationDidFinish(
+      .routeCommand(requestID: requestID, command: pending.command))
+    guard pending.replicaID == replicaID, pending.loadID == loadID,
+      pending.revision == revision, revision == currentRevision, pending.command == command,
+      replicas[replicaID]?.isFocused() == true
+    else {
+      pending.continuation.resume(returning: .unavailable)
+      return
+    }
+    guard result == .forwardedToHost else {
+      pending.continuation.resume(returning: result)
+      return
+    }
+    if case .invalidate = onEvent(.command(replicaID: replicaID, command: command)) {
+      invalidate()
+    }
+    pending.continuation.resume(returning: .forwardedToHost)
   }
 
   private func receiveFormatResult(
@@ -1120,6 +1341,17 @@ public final class CodeMirrorSession {
     pending.continuation.resume(throwing: error)
   }
 
+  private func finishPendingRouteCommand(
+    _ requestID: UUID,
+    with error: CodeMirrorSessionError
+  ) {
+    guard let pending = pendingRouteCommands.removeValue(forKey: requestID) else { return }
+    pending.timeoutTask?.cancel()
+    replicas[pending.replicaID]?.operationDidFinish(
+      .routeCommand(requestID: requestID, command: pending.command))
+    pending.continuation.resume(throwing: error)
+  }
+
   private func removeReplicaFromPendingOperations(_ replicaID: CodeMirrorReplicaID) {
     let flushRequestIDs = Array(pendingFlushes.keys)
     for requestID in flushRequestIDs {
@@ -1133,6 +1365,29 @@ public final class CodeMirrorSession {
         continue
       }
       finishPendingFormat(requestID, with: .replicaUnavailable)
+    }
+    let routeRequestIDs = Array(pendingRouteCommands.keys)
+    for requestID in routeRequestIDs {
+      guard let pending = pendingRouteCommands[requestID], pending.replicaID == replicaID else {
+        continue
+      }
+      finishPendingRouteCommand(requestID, with: .replicaUnavailable)
+    }
+  }
+
+  private func failRouteCommands(
+    for replicaID: CodeMirrorReplicaID,
+    loadID: UUID,
+    with error: CodeMirrorSessionError
+  ) {
+    let requestIDs = Array(pendingRouteCommands.keys)
+    for requestID in requestIDs {
+      guard let pending = pendingRouteCommands[requestID], pending.replicaID == replicaID,
+        pending.loadID == loadID
+      else {
+        continue
+      }
+      finishPendingRouteCommand(requestID, with: error)
     }
   }
 
@@ -1152,6 +1407,13 @@ public final class CodeMirrorSession {
         continue
       }
       finishPendingFormat(requestID, with: error)
+    }
+    let routeRequestIDs = Array(pendingRouteCommands.keys)
+    for requestID in routeRequestIDs {
+      guard let pending = pendingRouteCommands[requestID], pending.replicaID == replicaID else {
+        continue
+      }
+      finishPendingRouteCommand(requestID, with: error)
     }
   }
 }

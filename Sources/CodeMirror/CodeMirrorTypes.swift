@@ -197,6 +197,12 @@ public enum CodeMirrorCommand: String, Equatable, Hashable, Sendable, Codable {
   case redo
 }
 
+public enum CodeMirrorCommandRoutingResult: String, Equatable, Hashable, Sendable, Codable {
+  case forwardedToHost
+  case handledByEmbeddedControl
+  case unavailable
+}
+
 public enum CodeMirrorSessionError: Error, Equatable, Sendable, Codable {
   case invalidated
   case replicaUnavailable

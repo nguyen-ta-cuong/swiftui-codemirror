@@ -663,6 +663,161 @@ final class CodeMirrorSessionTests: XCTestCase {
   #endif
 
   #if os(macOS) && canImport(AppKit) && canImport(WebKit)
+    func testInitialNavigationRetainsReplicaIdentityAppearanceAndQueuedOperation() async throws {
+      let session = CodeMirrorSession(
+        initialText: "source",
+        configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 5_000)
+      ) { _ in .accept }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+      defer { coordinator.detach() }
+
+      guard let initialLoadID = coordinator.attachedLoadID else {
+        XCTFail("coordinator did not attach its initial replica")
+        return
+      }
+      let appearance = CodeMirrorAppearance(
+        colorScheme: .dark, increaseContrast: true, reduceTransparency: true)
+      session.update(appearance: appearance, for: replicaID)
+      let formatTask = Task { @MainActor in try await session.format(in: replicaID) }
+
+      for _ in 0..<80 {
+        if !coordinator.initialNavigationPending { break }
+        try await Task.sleep(nanoseconds: 25_000_000)
+      }
+      XCTAssertFalse(coordinator.initialNavigationPending)
+      XCTAssertEqual(coordinator.attachedLoadID, initialLoadID)
+      XCTAssertEqual(coordinator.pendingConfigurationAppearances, [appearance])
+      XCTAssertEqual(coordinator.pendingFormatCommandCount, 1)
+
+      coordinator.detach()
+      let result = await formatTask.result
+      if case .failure(let error) = result {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+      } else {
+        XCTFail("detaching the initial pre-ready replica unexpectedly completed format")
+      }
+    }
+
+    func testReplacementBeforeReadyRetiresOldLoadAndIgnoresDelayedMessages() async throws {
+      var readyEvents: [CodeMirrorEvent] = []
+      let session = CodeMirrorSession(
+        initialText: "source",
+        configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 5_000)
+      ) { event in
+        readyEvents.append(event)
+        return .accept
+      }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+      defer { coordinator.detach() }
+
+      guard let oldLoadID = coordinator.attachedLoadID else {
+        XCTFail("coordinator did not attach its initial replica")
+        return
+      }
+      for _ in 0..<80 {
+        if !coordinator.initialNavigationPending { break }
+        try await Task.sleep(nanoseconds: 25_000_000)
+      }
+      XCTAssertFalse(coordinator.initialNavigationPending)
+
+      let pending = Task { @MainActor in try await session.format(in: replicaID) }
+      for _ in 0..<20 {
+        if coordinator.pendingFormatCommandCount == 1 { break }
+        await Task.yield()
+      }
+      coordinator.webView(webView, didStartProvisionalNavigation: nil)
+
+      guard let replacementLoadID = coordinator.attachedLoadID else {
+        XCTFail("replacement navigation did not attach a new replica")
+        return
+      }
+      XCTAssertNotEqual(replacementLoadID, oldLoadID)
+      let result = await pending.result
+      if case .failure(let error) = result {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .transportFailure)
+      } else {
+        XCTFail("replacement navigation unexpectedly retained the old format")
+      }
+
+      session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: oldLoadID))
+      session.receive(.configured(sessionID: session.id, replicaID: replicaID, loadID: oldLoadID))
+      session.receive(
+        .focusScope(
+          sessionID: session.id,
+          replicaID: replicaID,
+          loadID: oldLoadID,
+          sequence: 1,
+          scope: .content
+        ))
+      XCTAssertFalse(
+        readyEvents.contains {
+          if case .ready = $0 { return true }
+          return false
+        })
+      XCTAssertNil(session.focusedEditorContentReplicaID())
+    }
+
+    func testCoordinatorFailureRetiresPendingOperationAndIgnoresDelayedOldMessages() async throws {
+      var events: [CodeMirrorEvent] = []
+      let session = CodeMirrorSession(
+        initialText: "source",
+        configuration: CodeMirrorConfiguration(commandTimeoutMilliseconds: 5_000)
+      ) { event in
+        events.append(event)
+        return .accept
+      }
+      let replicaID = CodeMirrorReplicaID()
+      let coordinator = CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+      coordinator.attach(webView: webView)
+      defer { coordinator.detach() }
+
+      guard let loadID = coordinator.attachedLoadID else {
+        XCTFail("coordinator did not attach its replica")
+        return
+      }
+      for _ in 0..<80 {
+        if !coordinator.initialNavigationPending { break }
+        try await Task.sleep(nanoseconds: 25_000_000)
+      }
+      let pending = Task { @MainActor in try await session.flush() }
+      for _ in 0..<20 {
+        if coordinator.pendingRequiredCommandCount == 1 { break }
+        await Task.yield()
+      }
+      coordinator.webView(
+        webView,
+        didFailProvisionalNavigation: nil,
+        withError: NSError(domain: "CodeMirrorTests", code: 1)
+      )
+
+      let result = await pending.result
+      if case .failure(let error) = result {
+        XCTAssertEqual(error as? CodeMirrorSessionError, .transportFailure)
+      } else {
+        XCTFail("failed navigation unexpectedly completed flush")
+      }
+      XCTAssertNil(coordinator.attachedLoadID)
+
+      session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+      session.receive(.configured(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+      session.receive(
+        .failure(
+          sessionID: session.id, replicaID: replicaID, loadID: loadID, code: "transportFailure"))
+      XCTAssertFalse(
+        events.contains {
+          if case .ready = $0 { return true }
+          return false
+        })
+      XCTAssertEqual(try session.snapshot().text, "source")
+    }
+
     func testStalledReadyTimesOutRequiredCommandsWithoutRetainingQueuedFormats() async throws {
       let session = CodeMirrorSession(
         initialText: "{\"value\": 1}",
@@ -909,6 +1064,33 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertNil(session.focusedReplicaID())
   }
 
+  func testFocusTraversalForwardsRapidDirectionsOnlyWhileNativeFocused() throws {
+    let focus = FocusProbe()
+    var directions: [Bool] = []
+    let session = CodeMirrorSession(initialText: "") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { _ in },
+      traverseFocus: { directions.append($0) }
+    )
+
+    focus.value = true
+    session.receive(
+      .focusTraversal(
+        sessionID: session.id, replicaID: replicaID, loadID: loadID, forward: true))
+    session.receive(
+      .focusTraversal(
+        sessionID: session.id, replicaID: replicaID, loadID: loadID, forward: false))
+    focus.value = false
+    session.receive(
+      .focusTraversal(
+        sessionID: session.id, replicaID: replicaID, loadID: loadID, forward: true))
+
+    XCTAssertEqual(directions, [true, false])
+  }
+
   func testInvalidatedSessionDoesNotReportFocus() throws {
     let session = CodeMirrorSession(initialText: "") { _ in .accept }
     let replicaID = CodeMirrorReplicaID()
@@ -916,6 +1098,652 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertEqual(session.focusedReplicaID(), replicaID)
     session.invalidate()
     XCTAssertNil(session.focusedReplicaID())
+  }
+
+  func testContentFocusScopeExcludesEmbeddedControlsAndIgnoresStaleReports() throws {
+    let focus = FocusProbe()
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { _ in }
+    )
+
+    focus.value = true
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 2,
+        scope: .content
+      ))
+    XCTAssertEqual(session.focusedReplicaID(), replicaID)
+    XCTAssertEqual(session.focusedEditorContentReplicaID(), replicaID)
+
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 1,
+        scope: .embeddedControl
+      ))
+    XCTAssertEqual(session.focusedEditorContentReplicaID(), replicaID)
+
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 3,
+        scope: .embeddedControl
+      ))
+    XCTAssertEqual(session.focusedReplicaID(), replicaID)
+    XCTAssertNil(session.focusedEditorContentReplicaID())
+
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 4,
+        scope: .other
+      ))
+    XCTAssertNil(session.focusedEditorContentReplicaID())
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 5,
+        scope: .content
+      ))
+    XCTAssertEqual(session.focusedEditorContentReplicaID(), replicaID)
+  }
+
+  func testRouteCommandForwardsOnceAndFailsClosedWhenFocusChanges() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 1,
+        scope: .content
+      ))
+
+    let forwardedTask = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<10 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    let forwardedResult = try await forwardedTask.value
+    XCTAssertEqual(forwardedResult, .forwardedToHost)
+    XCTAssertEqual(
+      events.compactMap { event in
+        if case .command(let eventReplicaID, let command) = event {
+          return (eventReplicaID, command)
+        }
+        return nil
+      }.count,
+      1
+    )
+
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    XCTAssertEqual(
+      events.compactMap { event in
+        if case .command = event { return event }
+        return nil
+      }.count,
+      1
+    )
+
+    let changingFocusTask = Task { @MainActor in
+      try await session.routeCommand(.redo, in: replicaID)
+    }
+    var changingFocusRequestID: UUID?
+    for _ in 0..<10 where changingFocusRequestID == nil {
+      await Task.yield()
+      changingFocusRequestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .redo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let changingFocusRequestID else {
+      XCTFail("redo route command was not sent")
+      return
+    }
+    focus.value = false
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: changingFocusRequestID,
+        command: .redo,
+        result: .forwardedToHost
+      ))
+    let changingFocusResult = await changingFocusTask.result
+    if case .success(let result) = changingFocusResult {
+      XCTAssertEqual(result, .unavailable)
+    } else {
+      XCTFail("route command failed instead of returning unavailable after focus changed")
+    }
+    XCTAssertEqual(
+      events.compactMap { event in
+        if case .command = event { return event }
+        return nil
+      }.count,
+      1
+    )
+  }
+
+  func testRouteCommandRejectsResponseFromStaleCurrentRevision() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<10 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+
+    let replacement = try session.replaceImmediately(
+      expectedRevision: .zero,
+      changes: [CodeMirrorChange(rangeUTF16: 0..<6, insertedText: "new")],
+      in: replicaID
+    )
+    XCTAssertEqual(replacement.revision, CodeMirrorRevision(1))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+
+    let staleResult = try await pending.value
+    XCTAssertEqual(staleResult, .unavailable)
+    XCTAssertEqual(try session.snapshot().text, "new")
+    XCTAssertFalse(
+      events.contains {
+        if case .command = $0 { return true }
+        return false
+      })
+  }
+
+  func testRouteCommandIgnoresWrongIdentityAndCommandWithoutPublishing() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<20 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+
+    session.receive(
+      .commandRouteResult(
+        sessionID: CodeMirrorSessionID(),
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: UUID(),
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .redo,
+        result: .forwardedToHost
+      ))
+
+    let result = await pending.result
+    if case .success(let value) = result {
+      XCTAssertEqual(value, .unavailable)
+    } else {
+      XCTFail("wrong route identity unexpectedly failed the request")
+    }
+    XCTAssertFalse(
+      events.contains {
+        if case .command = $0 { return true }
+        return false
+      })
+
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    XCTAssertFalse(
+      events.contains {
+        if case .command = $0 { return true }
+        return false
+      })
+  }
+
+  func testRouteCommandInvalidationResumesWithoutPublishing() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<20 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+
+    session.invalidate()
+    let result = await pending.result
+    if case .failure(let error) = result {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .invalidated)
+    } else {
+      XCTFail("invalidating the session unexpectedly completed route command")
+    }
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    XCTAssertFalse(
+      events.contains {
+        if case .command = $0 { return true }
+        return false
+      })
+  }
+
+  func testRouteCommandUsesResultAfterCachedFocusChanges() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 1,
+        scope: .content
+      ))
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<10 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        sequence: 2,
+        scope: .embeddedControl
+      ))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .handledByEmbeddedControl
+      ))
+
+    let embeddedResult = try await pending.value
+    XCTAssertEqual(embeddedResult, .handledByEmbeddedControl)
+    XCTAssertFalse(
+      events.contains {
+        if case .command = $0 { return true }
+        return false
+      })
+  }
+
+  func testReplacingReplicaRetiresOldPageMessagesAndPendingRoute() async throws {
+    let focus = FocusProbe()
+    var events: [CodeMirrorEvent] = []
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      events.append(event)
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let oldLoadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<10 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+
+    let newLoadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    XCTAssertNotEqual(oldLoadID, newLoadID)
+    let replacementResult = await pending.result
+    if case .failure(let error) = replacementResult {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .replicaUnavailable)
+    } else {
+      XCTFail("replacing a replica unexpectedly acknowledged its old route")
+    }
+
+    session.receive(
+      .configured(sessionID: session.id, replicaID: replicaID, loadID: oldLoadID))
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: oldLoadID,
+        sequence: 1,
+        scope: .content
+      ))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: oldLoadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    XCTAssertFalse(
+      events.contains { event in
+        if case .command = event { return true }
+        return false
+      })
+    XCTAssertNil(session.focusedEditorContentReplicaID())
+
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: newLoadID))
+    session.receive(.configured(sessionID: session.id, replicaID: replicaID, loadID: newLoadID))
+    session.receive(
+      .focusScope(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: newLoadID,
+        sequence: 1,
+        scope: .content
+      ))
+    XCTAssertEqual(session.focusedEditorContentReplicaID(), replicaID)
+    XCTAssertTrue(
+      events.contains { event in
+        if case .ready(let eventReplicaID, let eventLoadID) = event {
+          return eventReplicaID == replicaID && eventLoadID == newLoadID
+        }
+        return false
+      })
+  }
+
+  func testRouteCommandIgnoresWrongReplicaResultUntilCancellation() async throws {
+    let focus = FocusProbe()
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+    let pending = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID)
+    }
+    var requestID: UUID?
+    for _ in 0..<10 where requestID == nil {
+      await Task.yield()
+      requestID =
+        commands.compactMap { command in
+          if case .routeCommand(let value, .undo) = command { return value }
+          return nil
+        }.first
+    }
+    guard let requestID else {
+      XCTFail("route command was not sent")
+      return
+    }
+
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: CodeMirrorReplicaID(),
+        loadID: loadID,
+        revision: .zero,
+        requestID: requestID,
+        command: .undo,
+        result: .forwardedToHost
+      ))
+    pending.cancel()
+    let result = await pending.result
+    if case .failure(let error) = result {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .timeout)
+    } else {
+      XCTFail("a wrong-replica route result unexpectedly completed the request")
+    }
+  }
+
+  func testRouteCommandCancellationAndOverflowAreRecoverable() async throws {
+    let focus = FocusProbe()
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    _ = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+
+    let pending = (0..<32).map { _ in
+      Task { @MainActor in
+        try await session.routeCommand(.undo, in: replicaID)
+      }
+    }
+    for _ in 0..<40 {
+      await Task.yield()
+    }
+    let overflowTask = Task { @MainActor in
+      try await session.routeCommand(.redo, in: replicaID)
+    }
+    let overflow = await overflowTask.result
+    if case .failure(let error) = overflow {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .timeout)
+    } else {
+      XCTFail("route command overflow unexpectedly succeeded")
+    }
+
+    pending[0].cancel()
+    let cancellation = await pending[0].result
+    if case .failure(let error) = cancellation {
+      XCTAssertEqual(error as? CodeMirrorSessionError, .timeout)
+    } else {
+      XCTFail("cancelled route command unexpectedly succeeded")
+    }
+    for task in pending.dropFirst() {
+      task.cancel()
+      _ = await task.result
+    }
+    XCTAssertEqual(
+      commands.filter {
+        if case .routeCommand = $0 { return true }
+        return false
+      }.count, 32)
   }
 
   #if os(macOS) && canImport(AppKit) && canImport(WebKit)
@@ -931,6 +1759,7 @@ final class CodeMirrorSessionTests: XCTestCase {
         backing: .buffered,
         defer: false
       )
+      window.isReleasedWhenClosed = false
       window.contentView = container
       container.addSubview(webView)
       coordinator.attach(webView: webView)

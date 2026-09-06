@@ -16,7 +16,21 @@ import {
 function makeController(initialText = "") {
   const messages = [];
   const handlers = new Map();
-  const controller = new EditorController(message => messages.push(message), { body: null });
+  const documentHandlers = new Map();
+  const findInput = {};
+  const documentRef = {
+    body: null,
+    activeElement: null,
+    querySelector(selector) {
+      return selector === ".cm-search input" ? findInput : null;
+    },
+    queryCommandSupported() { return false; },
+    queryCommandEnabled() { return false; },
+    execCommand() { return false; },
+    addEventListener(name, handler) { documentHandlers.set(name, handler); },
+    removeEventListener(name) { documentHandlers.delete(name); }
+  };
+  const controller = new EditorController(message => messages.push(message), documentRef);
   controller.sessionID = "session";
   controller.replicaID = "replica";
   controller.loadID = "load";
@@ -30,6 +44,7 @@ function makeController(initialText = "") {
   controller.view = {
     get state() { return state; },
     set state(value) { state = value; },
+    contentDOM: {},
     dom,
     dispatch(spec) {
       if (!spec.changes && !spec.selection && !spec.effects) {
@@ -48,7 +63,15 @@ function makeController(initialText = "") {
     },
     destroy() {}
   };
-  return { controller, handlers, messages, get text() { return state.doc.toString(); } };
+  return {
+    controller,
+    documentHandlers,
+    documentRef,
+    findInput,
+    handlers,
+    messages,
+    get text() { return state.doc.toString(); }
+  };
 }
 
 function applyLocalChange(controller, spec) {
@@ -248,6 +271,112 @@ test("Ctrl-Tab traversal requests native focus movement in both directions", () 
   harness.controller.destroy();
 });
 
+test("routeCommand uses live Find history and never operates a stale or other focus", async () => {
+  const harness = makeController("one");
+  const { controller, documentHandlers, documentRef, findInput, messages } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  documentRef.activeElement = controller.view.contentDOM;
+  controller.installFocusHandlers();
+  controller.reportFocusScope(true);
+  assert.deepEqual(messages.at(-1), {
+    type: "focusScope",
+    focusSequence: 1,
+    focusScope: "content",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+
+  controller.receive({ type: "routeCommand", requestID: "content-undo", command: "undo" });
+  assert.deepEqual(messages.at(-1), {
+    type: "commandRouteResult",
+    requestID: "content-undo",
+    revision: 0,
+    command: "undo",
+    result: "forwardedToHost",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+
+  documentRef.activeElement = findInput;
+  findInput.value = "q";
+  const historyCommands = [];
+  documentRef.queryCommandSupported = command => command === "undo";
+  documentRef.queryCommandEnabled = command => command === "undo" && findInput.value === "q";
+  documentRef.execCommand = command => {
+    historyCommands.push(command);
+    if (command === "undo" && findInput.value === "q") {
+      findInput.value = "";
+      return true;
+    }
+    return false;
+  };
+  controller.receive({ type: "routeCommand", requestID: "find-undo", command: "undo" });
+  assert.deepEqual(messages.at(-1), {
+    type: "commandRouteResult",
+    requestID: "find-undo",
+    revision: 0,
+    command: "undo",
+    result: "handledByEmbeddedControl",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+  assert.deepEqual(historyCommands, ["undo"]);
+  assert.equal(findInput.value, "");
+  assert.equal(messages.filter(message => message.type === "focusScope").length, 1);
+
+  documentHandlers.get("focusin")();
+  await waitForEventLoop();
+  assert.deepEqual(messages.at(-1), {
+    type: "focusScope",
+    focusSequence: 2,
+    focusScope: "embeddedControl",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+
+  documentRef.queryCommandSupported = command => command === "redo";
+  documentRef.queryCommandEnabled = command => command === "redo" && findInput.value === "";
+  documentRef.execCommand = command => {
+    historyCommands.push(command);
+    if (command === "redo" && findInput.value === "") {
+      findInput.value = "q";
+      return true;
+    }
+    return false;
+  };
+  controller.receive({ type: "routeCommand", requestID: "find-redo", command: "redo" });
+  assert.equal(messages.at(-1).result, "handledByEmbeddedControl");
+  assert.deepEqual(historyCommands, ["undo", "redo"]);
+  assert.equal(findInput.value, "q");
+
+  documentRef.queryCommandSupported = command => command === "undo";
+  documentRef.queryCommandEnabled = () => true;
+  documentRef.execCommand = command => {
+    historyCommands.push(`${command}-failed`);
+    return false;
+  };
+  controller.receive({ type: "routeCommand", requestID: "find-undo-failed", command: "undo" });
+  assert.equal(messages.at(-1).result, "unavailable");
+  assert.deepEqual(historyCommands, ["undo", "redo", "undo-failed"]);
+  assert.equal(findInput.value, "q");
+
+  documentRef.activeElement = {};
+  documentHandlers.get("focusout")();
+  await waitForEventLoop();
+  controller.receive({ type: "routeCommand", requestID: "other-undo", command: "undo" });
+  assert.equal(messages.at(-1).result, "unavailable");
+  assert.equal(messages.filter(message => message.type === "command").length, 0);
+  assert.equal(harness.text, "one");
+  controller.destroy();
+  assert.equal(documentHandlers.size, 0);
+  assert.equal(harness.handlers.size, 0);
+});
+
 test("compositionend waits for the final CodeMirror update before flushing", async () => {
   const { controller, handlers, messages } = makeController("");
   controller.configured = true;
@@ -304,7 +433,7 @@ test("initial configuration replaces only the disabled loading document and neve
   assert.equal(harness.text, "authoritative initial source");
   assert.equal(messages.some(message => message.type === "transaction"), false);
   assert.equal(controller.initializing, false);
-  assert.equal(messages.at(-1).type, "configured");
+  assert.equal(messages.filter(message => message.type === "configured").length, 1);
   controller.destroy();
 });
 

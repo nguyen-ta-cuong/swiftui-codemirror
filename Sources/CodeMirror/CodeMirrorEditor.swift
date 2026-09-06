@@ -189,6 +189,8 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   private var allowedReadRoot: URL?
   private var isReady = false
   private var isConfigured = false
+  private var acceptsReady = false
+  private var isAwaitingInitialNavigation = false
   private var pendingCommands: [CodeMirrorHostCommand] = []
   private var lifecycleID = UUID()
 
@@ -198,6 +200,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     pendingCommands.reduce(into: 0) { count, command in
       if case .format = command { count += 1 }
       if case .flush = command { count += 1 }
+      if case .routeCommand = command { count += 1 }
     }
   }
   internal var pendingFormatCommandCount: Int {
@@ -205,40 +208,64 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       if case .format = command { count += 1 }
     }
   }
+  internal var pendingConfigurationAppearances: [CodeMirrorAppearance] {
+    pendingCommands.compactMap { command in
+      switch command {
+      case .configure(let configuration, _, _, _), .updateConfiguration(let configuration):
+        return configuration.appearance
+      default:
+        return nil
+      }
+    }
+  }
   internal var pageIsReady: Bool { isReady }
   internal var pageIsConfigured: Bool { isConfigured }
+  internal var initialNavigationPending: Bool { isAwaitingInitialNavigation }
 
   init(session: CodeMirrorSession, replicaID: CodeMirrorReplicaID) {
     self.session = session
     self.replicaID = replicaID
   }
 
+  private func attachSessionReplica() throws -> UUID {
+    guard let session else {
+      throw CodeMirrorSessionError.replicaUnavailable
+    }
+    return try session.attach(
+      replicaID: replicaID,
+      isFocused: { [weak self] in
+        self?.isNativeFocused ?? false
+      },
+      send: { [weak self] command in
+        self?.send(command)
+      },
+      traverseFocus: { [weak self] forward in
+        self?.traverseNativeFocus(forward: forward)
+      },
+      operationDidFinish: { [weak self] command in
+        self?.removePendingOperation(command)
+      }
+    )
+  }
+
   func attach(webView: WKWebView) {
     lifecycleID = UUID()
+    acceptsReady = false
+    isReady = false
+    isConfigured = false
+    isAwaitingInitialNavigation = true
     self.webView = webView
     webView.navigationDelegate = self
     webView.uiDelegate = self
     do {
-      loadID = try session?.attach(
-        replicaID: replicaID,
-        isFocused: { [weak self] in
-          self?.isNativeFocused ?? false
-        },
-        send: { [weak self] command in
-          self?.send(command)
-        },
-        traverseFocus: { [weak self] forward in
-          self?.traverseNativeFocus(forward: forward)
-        },
-        operationDidFinish: { [weak self] command in
-          self?.removePendingOperation(command)
-        }
-      )
+      loadID = try attachSessionReplica()
     } catch let error as CodeMirrorSessionError {
+      isAwaitingInitialNavigation = false
       session?.reportTransportFailure(replicaID: replicaID, loadID: loadID ?? UUID())
       _ = error
       return
     } catch {
+      isAwaitingInitialNavigation = false
       session?.reportTransportFailure(replicaID: replicaID, loadID: loadID ?? UUID())
       return
     }
@@ -247,6 +274,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
         forResource: "index", withExtension: "html", subdirectory: "web.bundle"),
       let bundleURL = Bundle.module.url(forResource: "web.bundle", withExtension: nil)
     else {
+      isAwaitingInitialNavigation = false
       session?.reportTransportFailure(replicaID: replicaID, loadID: loadID ?? UUID())
       return
     }
@@ -268,6 +296,8 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       evaluate(.invalidate, lifecycleID: detachingLifecycleID)
     }
     lifecycleID = UUID()
+    acceptsReady = false
+    isAwaitingInitialNavigation = false
     if let loadID {
       session?.detach(replicaID: replicaID, loadID: loadID)
     }
@@ -353,7 +383,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
           if case .showFind = command { return true }
           return false
         }, with: command)
-    case .format, .flush:
+    case .format, .flush, .routeCommand:
       guard pendingRequiredCommandCount < Self.maximumPendingRequiredCommands else {
         return false
       }
@@ -380,6 +410,13 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     case .flush(let requestID):
       pendingCommands.removeAll { command in
         if case .flush(let queuedRequestID) = command {
+          return queuedRequestID == requestID
+        }
+        return false
+      }
+    case .routeCommand(let requestID, _):
+      pendingCommands.removeAll { command in
+        if case .routeCommand(let queuedRequestID, _) = command {
           return queuedRequestID == requestID
         }
         return false
@@ -418,8 +455,21 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   }
 
   private func transportFailed() {
+    acceptsReady = false
+    isReady = false
+    isConfigured = false
+    isAwaitingInitialNavigation = false
+    lifecycleID = UUID()
+    let queued = pendingCommands
+    pendingCommands.removeAll()
+    for command in queued {
+      session?.failQueuedOperation(command)
+    }
     guard let loadID else { return }
+    session?.clearFocusScope(replicaID: replicaID, loadID: loadID)
     session?.reportTransportFailure(replicaID: replicaID, loadID: loadID)
+    session?.detach(replicaID: replicaID, loadID: loadID)
+    self.loadID = nil
   }
 
   private var isNativeFocused: Bool {
@@ -495,6 +545,7 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     guard message.name == Self.messageHandlerName, message.frameInfo.isMainFrame else { return }
     do {
       let inbound = try CodeMirrorInboundMessage.decode(message.body)
+      guard acceptsReady else { return }
       let normalizedInbound: CodeMirrorInboundMessage
       if case .ready = inbound {
         isReady = true
@@ -546,6 +597,45 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
   ) {
     decisionHandler(isLocalURL(navigationResponse.response.url) ? .allow : .cancel)
+  }
+
+  func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+    guard self.webView === webView else { return }
+    if isAwaitingInitialNavigation {
+      isAwaitingInitialNavigation = false
+      return
+    }
+    let hadLivePage = isReady || isConfigured
+    let previousLoadID = loadID
+    isReady = false
+    isConfigured = false
+    acceptsReady = false
+    lifecycleID = UUID()
+    let queued = pendingCommands
+    pendingCommands.removeAll()
+    for command in queued {
+      session?.failQueuedOperation(command)
+    }
+    if let previousLoadID {
+      if hadLivePage {
+        session?.reportTransportFailure(replicaID: replicaID, loadID: previousLoadID)
+      }
+      session?.detach(replicaID: replicaID, loadID: previousLoadID)
+    }
+    self.loadID = nil
+    do {
+      self.loadID = try attachSessionReplica()
+    } catch {
+      if let previousLoadID {
+        session?.reportTransportFailure(replicaID: replicaID, loadID: previousLoadID)
+      }
+      return
+    }
+  }
+
+  func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    guard self.webView === webView else { return }
+    acceptsReady = true
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
