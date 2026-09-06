@@ -1,335 +1,60 @@
-<div markdown="1">
-  <sup>Using <a href="https://wangchujiang.com/#/app" target="_blank">my app</a> is also a way to <a href="https://wangchujiang.com/#/sponsor" target="_blank">support</a> me:</sup>
-  <br>
-    <a target="_blank" href="https://apps.apple.com/app/VidCrop/6752624705" title="VidCrop for macOS"><img align="center" alt="VidCrop" height="52" width="52" src="https://github.com/user-attachments/assets/91d2b281-271a-4107-9ef6-f3b11bd6dbac"></a>
-    <a target="_blank" href="https://apps.apple.com/app/Vidwall/6747587746" title="Vidwall for macOS"><img align="center" alt="Vidwall" height="52" width="52" src="https://github.com/user-attachments/assets/7b5df70a-ed91-4d4b-85be-f00e60a09ce9"></a>
-    <a target="_blank" href="https://wangchujiang.com/mousio-hint/" title="Mousio Hint for macOS"><img align="center" alt="Mousio Hint" height="52" width="52" src="https://github.com/user-attachments/assets/3c0af128-0cef-44e5-a8db-4741dc5a6690"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6746747327" title="Mousio for macOS"><img align="center" alt="Mousio" height="52" width="52" src="https://github.com/user-attachments/assets/9edf61ff-5a6c-4676-9cc2-8fd3c1ad0dfb"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6745227444" title="Musicer for macOS"><img align="center" alt="Musicer" height="52" width="52" src="https://github.com/user-attachments/assets/b7abfba8-88ff-4c86-a125-43073d5aef22"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6743841447" title="Audioer for macOS"><img align="center" alt="Audioer" height="52" width="52" src="https://github.com/user-attachments/assets/7a836865-8c90-4119-87bc-19e06a76c957"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6744690194" title="FileSentinel for macOS"><img align="center" alt="FileSentinel" height="52" width="52" src="https://github.com/user-attachments/assets/28bce2cc-290e-45bf-9068-585ff6ecafe9"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6743495172" title="FocusCursor for macOS"><img align="center" alt="FocusCursor" height="52" width="52" src="https://github.com/user-attachments/assets/d543668a-737b-4853-a6bb-eaa269e69836"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6742680573" title="Videoer for macOS"><img align="center" alt="Videoer" height="52" width="52" src="https://github.com/user-attachments/assets/10ffb0f1-0625-40d6-93f1-2c2496592595"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6740425504" title="KeyClicker for macOS"><img align="center" alt="KeyClicker" height="52" width="52" src="https://github.com/user-attachments/assets/5a19fcb9-cb81-4855-b4ea-31c604d9612a"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6739052447" title="DayBar for macOS"><img align="center" alt="DayBar" height="52" width="52" src="https://github.com/user-attachments/assets/771b608d-594c-492d-8532-d9231e383f5b"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6739444407" title="Iconed for macOS"><img align="center" alt="Iconed" height="52" width="52" src="https://github.com/user-attachments/assets/8a35dc7b-4faf-4e2a-9311-f66d6844a896"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6737160756" title="RightMenu Master for macOS"><img align="center" alt="RightMenu Master" height="52" width="52" src="https://github.com/user-attachments/assets/39a76541-71bf-4de7-a01c-c62f0557dff5"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6723903021" title="Paste Quick for macOS"><img align="center" alt="Quick RSS" height="52" width="52" src="https://github.com/user-attachments/assets/bdaad5b7-9810-44ce-8f17-8410864465d2"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6670696072" title="Quick RSS for macOS/iOS"><img align="center" alt="Quick RSS" height="52" width="52" src="https://github.com/user-attachments/assets/374106b5-a448-4d1d-9ccb-b04b6bc681ed"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6670167443" title="Web Serve for macOS"><img align="center" alt="Web Serve" height="52" width="52" src="https://github.com/user-attachments/assets/e1d9f76f-0f3d-4ba5-8a15-253ee173bb1c"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6503953628" title="Copybook Generator for macOS/iOS"><img align="center" alt="Copybook Generator" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/b90e42ff-158b-4534-82ca-5898fd0e8d73"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6471227008" title="DevTutor for macOS/iOS"><img align="center" alt="DevTutor for SwiftUI" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/f15c154d-0192-48eb-8e0e-9e245ffd974a"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6479819388" title="RegexMate for macOS/iOS"><img align="center" alt="RegexMate" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/aabe5aa9-9a96-4390-8bed-c3e4023d0dea"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6479194014" title="Time Passage for macOS/iOS"><img align="center" alt="Time Passage" height="52" width="52" src="https://github.com/jaywcjlove/time-passage/assets/1680273/6f30e429-e6f3-4dbe-9921-a5effe2a05e9"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6478772538" title="IconizeFolder for macOS"><img align="center" alt="Iconize Folder" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/fa9d8b9c-1e51-4ded-877c-fa5b21c47220"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6478511402" title="Textsound Saver for macOS/iOS"><img align="center" alt="Textsound Saver" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/0595e842-980b-4574-8891-a8ba853a08be"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6476924627" title="Create Custom Symbols for macOS"><img align="center" alt="Create Custom Symbols" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/8cd022ce-a3f1-4e89-b7c6-6fbd0d4db77c"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6476452351" title="DevHub for macOS"><img align="center" alt="DevHub" height="52" width="52" src="https://github.com/user-attachments/assets/4a44a4fd-67ce-430b-af0a-72f18feaa47d"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6476400184" title="Resume Revise for macOS"><img align="center" alt="Resume Revise" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/c9954a20-1905-48de-bdf8-d71837974aa2"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6472593276" title="Palette Genius for macOS"><img align="center" alt="Palette Genius" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/27340413-d355-45b2-8f6f-6ac37682d957"></a>
-    <a target="_blank" href="https://apps.apple.com/app/6470879005" title="Symbol Scribe for macOS"><img align="center" alt="Symbol Scribe" height="52" width="52" src="https://github.com/jaywcjlove/jaywcjlove/assets/1680273/c7249f05-fa70-4def-a1e9-571d5f171fc9"></a>
-</div>
-<hr>
+# CodeMirror
 
-CodeMirror
-===
+SwiftUI CodeMirror 6 transport for native macOS and iOS editors. The package owns the bundled WebKit page and JavaScript bridge while the host owns the authoritative text, document undo, validation, and session lifetime.
 
-![CodeMirror for macOS/iOS](https://github.com/user-attachments/assets/2d25564c-bb2b-4297-a4c5-1db03d13a5ce)
+## Swift package
 
-SwiftUI wrapper for CodeMirror 6.
-
-## Features
-
-- Minimal and fast
-- Handles large documents with ease
-- [40+ themes](https://uiwjs.github.io/react-codemirror/#/theme) available
-- macOS & iOS support
-- Built with SwiftUI
-
-## Installation
-
-### Swift Package Manager
-
-Add CodeMirror to your project using Xcode:
-
-1. In Xcode, go to `File` → `Add Package Dependencies...`
-2. Enter the repository URL: `https://github.com/jaywcjlove/swiftui-codemirror.git`
-3. Click `Add Package`
-
-Or add it to your `Package.swift` file:
+Add the package as a local or remote Swift package and import `CodeMirror`.
 
 ```swift
-dependencies: [
-    .package(url: "https://github.com/jaywcjlove/swiftui-codemirror.git", from: "1.0.0")
-]
-```
-
-## Usage
-
-### CodeMirror
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value, prompt: String(localized: "Please enter text"))
-        CodeMirror(value: $value)
-            .onLoadSuccess() {
-                print("Hello!")
-            }
-            .onLoadFailed { error in
-                print("@@@2 \(#function) \(error)")
-            }
-            .onContentChange { value in
-                print("@@@3 Content Did Change")
-            }
+let session = CodeMirrorSession(
+    initialText: "{\"enabled\":true}",
+    configuration: CodeMirrorConfiguration(
+        language: .json,
+        editorName: "Response body"
+    )
+) { event in
+    switch event {
+    case .transaction(_, let snapshot):
+        return .accept
+    default:
+        return .accept
     }
 }
+
+CodeMirrorEditor(session: session)
 ```
 
-**Set Line Wrapping**
+`CodeMirrorSession` is main-actor owned. Its event callback is synchronous so a host reducer can accept a transaction, replace it with authoritative text, or invalidate the session before the WebKit replica receives an acknowledgement. `CodeMirrorChange` ranges and selections use UTF-16 offsets; inbound changes must carry the source preimage, which the session validates and normalizes before acceptance.
 
-```swift
-struct ContentView: View {
-    @State var lineWrapping = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLineWrapping($lineWrapping)
-    }
-}
+Use `flush()` before saving, exporting, running, navigating, or tearing down an editor. Use `replace` for host-owned undo and redo; those replacements update replicas without generating editor events or WebKit history entries. `focusedReplicaID()` checks the current native key-window responder synchronously and returns no replica for an unmounted, hidden, inactive, invalidated, or native-form-focused view.
+
+The supported language values are `.text`, `.json`, `.xml`, and `.graphql`. JSON formatting is lexical: it preserves number lexemes, key order, duplicate keys, and string escapes. Documents larger than 1 MiB remain editable in plain mode while syntax analysis and formatting report unavailable.
+
+## Local bundle development
+
+The JavaScript source and lockfile live in `codemirrorjs`.
+
+```sh
+cd codemirrorjs
+npm ci
+npm test
+npm run build
 ```
 
-**Show Line Numbers**
+The build writes the reproducible bundle to `Sources/CodeMirror/web.bundle/codemirror.bundle.js`. The HTML page uses a non-networking local-only CSP and the native wrapper uses a nonpersistent WebKit data store. No application source or body text is interpolated into JavaScript source.
 
-```swift
-struct ContentView: View {
-    @State var lineNumber = true
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLineNumber($lineNumber)
-    }
-}
-```
+## Provenance
 
-**Show Fold Gutter**
-
-```swift
-struct ContentView: View {
-    @State var foldGutter = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmFoldGutter($foldGutter)
-    }
-}
-```
-
-**Set Editor Read-Only**
-
-```swift
-struct ContentView: View {
-    @State var readOnly = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmReadOnly($readOnly)
-    }
-}
-```
-
-**Set enabled search**
-
-```swift
-struct ContentView: View {
-    @State var enabledSearch = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmEnabledSearch(.constant(false))
-    }
-}
-```
-
-**Set Font Size**
-
-```swift
-CodeMirror(value: $value)
-    .cmFontSize(.constant(14))
-```
-
-**Set Highlight Active Line**
-
-```swift
-CodeMirror(value: $value)
-    .cmHighlightActiveLine(.constant(false))
-```
-
-**Set Programming Language**
-
-```swift
-struct ContentView: View {
-    @State var language: Language = .json
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLanguage($language)
-    }
-}
-```
-
-Support: `C`, `C++`, `CQL`, `CSS`, `Go`, `HTML`, `Java`, `JavaScript`, `JSON`, `JSX`, `LESS`, `Liquid`, `MariaDB SQL`, `Markdown`, `MS SQL`, `MySQL`, `PHP`, `PLSQL`, `PostgreSQL`, `Python`, `Rust`, `Sass`, `SCSS`, `SQL`, `SQLite`, `TSX`, `TypeScript`, `WebAssembly`, `XML`, `YAML`, `APL`, `PGP`, `ASN.1`, `Asterisk`, `Brainfuck`, `Cobol`, `C#`, `Clojure`, `ClojureScript`, `Closure Stylesheets (GSS)`, `CMake`, `CoffeeScript`, `Common Lisp`, `Cypher`, `Cython`, `Crystal`, `D`, `Dart`, `diff`, `Dockerfile`, `DTD`, `Dylan`, `EBNF`, `ECL`, `edn`, `Eiffel`, `Elm`, `Erlang`, `Esper`, `Factor`, `FCL`, `Forth`, `Fortran`, `F#`, `Gas`, `Gherkin`, `Groovy`, `Haskell`, `Haxe`, `HXML`, `HTTP`, `IDL`, `JSON-LD`, `Jinja2`, `Julia`, `Kotlin`, `LiveScript`, `Lua`, `mIRC`, `Mathematica`, `Modelica`, `MUMPS`, `Mbox`, `Nginx`, `NSIS`, `NTriples`, `Objective-C`, `Objective-C++`, `OCaml`, `Octave`, `Oz`, `Pascal`, `Perl`, `Pig`, `PowerShell`, `Properties files`, `ProtoBuf`, `Pug`, `Puppet`, `Q`, `R`, `RPM Changes`, `RPM Spec`, `Ruby`, `SAS`, `Scala`, `Scheme`, `Shell`, `Sieve`, `Smalltalk`, `Solr`, `SML`, `SPARQL`, `Spreadsheet`, `Squirrel`, `Stylus`, `Swift`, `sTeX`, `LaTeX`, `SystemVerilog`, `Tcl`, `Textile`, `TiddlyWiki`, `Tiki wiki`, `TOML`, `Troff`, `TTCN`, `TTCN_CFG`, `Turtle`, `Web IDL`, `VB.NET`, `VBScript`, `Velocity`, `Verilog`, `VHDL`, `XQuery`, `Yacas`, `Z80`, `MscGen`, `Xù`, `MsGenny`, `Vue`, `Angular Template`,
-
-**Set Theme**
-
-```swift
-struct ContentView: View {
-    @Environment(\.colorScheme) var colorScheme
-    @State var theme: Themes = .vscodelight
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmTheme($theme)
-            .cmTheme(
-                colorScheme == .dark ? .constant(.vscodedark) : .constant(.vscodelight)
-            )
-    }
-}
-```
-
-### CodeMirrorView
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @ObservedObject var vm: CodeMirrorVM = .init()
-    @State var value: String = ""
-    var body: some View {
-        CodeMirrorView(vm, value: $value)
-            .onAppear {
-                vm.setContent(jsonString)
-            }
-    }
-}
-```
-
-**Set Theme**
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @ObservedObject var vm: CodeMirrorVM = .init()
-    @State var value: String = ""
-    var body: some View {
-        VStack {
-            CodeMirrorView(vm, value: $value)
-                .onAppear {
-                    vm.setContent(jsonString)
-                }
-            Picker("Theme", selection: $vm.theme) {
-                ForEach(Themes.allCases, id: \.rawValue) {
-                    Text($0.rawValue).tag($0)
-                }
-            }
-        }
-    }
-}
-```
-
-**Set Programming Language**
-
-```swift
-Picker("Lang", selection: $vm.language) {
-    ForEach(Language.allCases, id: \.rawValue) {
-        Text($0.rawValue).tag($0)
-    }
-}
-```
-
-```swift
-vm.language = .json
-```
-
-**Set Editor Content**
-
-```swift
-Button {
-    vm.setContent("Hello World!")
-} label: {
-    Text("SET")
-}
-```
-
-**Get Editor Text Content**
-
-```swift
-Button {
-    Task {
-        let content = try? await vm.getContent()
-        print(content ?? "")
-    }
-} label: {
-    Text("GET")
-}
-```
-
-**Set Editor Read-Only**
-
-```swift
-Toggle(isOn: $vm.readOnly, label: { Text("Read Only") })
-    .toggleStyle(.checkbox)
-```
-
-**Show Line Numbers**
-
-```swift
-ToolbarItem {
-    Toggle(isOn: $vm.lineNumber, label: { Text("Line Number") })
-        .toggleStyle(.checkbox)
-}
-```
-
-**Set Line Wrapping**
-
-```swift
-ToolbarItem {
-    Toggle(isOn: $vm.lineWrapping, label: { Text("Line Wrapping") })
-        .toggleStyle(.checkbox)
-}
-```
-
-**Event**
-
-```swift
-@ObservedObject var vm: CodeMirrorVM = .init(
-    onLoadSuccess: {
-        print("@@@1 \(#function)")
-    },
-    onLoadFailed: { error in
-        print("@@@2 \(#function) \(error)")
-    },
-    onContentChange: { value in
-        print("@@@3 Content Did Change")
-    }
-)
-```
+This fork is based on `jaywcjlove/swiftui-codemirror` v2.8.3 and retains the upstream acknowledgments and MIT license. CodeMirror 6 language support is provided by the CodeMirror project, `cm6-graphql` from GraphiQL, and the packages recorded in `codemirrorjs/package-lock.json`.
 
 ## Acknowledgments
-
-Thanks to these projects:
 
 - https://codemirror.net
 - https://github.com/khoi/codemirror-swift
 - https://github.com/ProxymanApp/CodeMirror-Swift
+- https://github.com/graphql/graphiql/tree/main/packages/cm6-graphql
 
 ## License
 
-Licensed under the MIT License.
+Licensed under the MIT License. See [LICENSE](LICENSE).
