@@ -433,7 +433,7 @@ private func selectionPayload(_ selection: CodeMirrorSelection) -> [String: Any]
 
 @MainActor
 public final class CodeMirrorSession {
-  private static let maximumPendingRouteCommands = 32
+  private static let maximumPendingOperations = 32
 
   public let id: CodeMirrorSessionID
   public private(set) var configuration: CodeMirrorConfiguration
@@ -451,6 +451,10 @@ public final class CodeMirrorSession {
   private var commandContexts: [CodeMirrorReplicaID: CommandContextReport] = [:]
   private var isInvalidated = false
   private let onEvent: @MainActor (CodeMirrorEvent) -> CodeMirrorEventDisposition
+
+  private var pendingOperationCount: Int {
+    pendingFlushes.count + pendingFormats.count + pendingRouteCommands.count
+  }
 
   private struct ReplicaConnection {
     let loadID: UUID
@@ -617,7 +621,7 @@ public final class CodeMirrorSession {
     guard replica.isFocused() else {
       return .unavailable
     }
-    guard pendingRouteCommands.count < Self.maximumPendingRouteCommands else {
+    guard pendingOperationCount < Self.maximumPendingOperations else {
       throw CodeMirrorSessionError.timeout
     }
     let requestID = UUID()
@@ -659,6 +663,9 @@ public final class CodeMirrorSession {
     let replicaIDs = Set(replicas.keys)
     guard !replicaIDs.isEmpty else {
       return try snapshot()
+    }
+    guard pendingOperationCount < Self.maximumPendingOperations else {
+      throw CodeMirrorSessionError.timeout
     }
     let requestID = UUID()
     return try await withCheckedThrowingContinuation { continuation in
@@ -742,6 +749,9 @@ public final class CodeMirrorSession {
       throw CodeMirrorSessionError.invalidated
     }
     _ = try replica(replicaID)
+    guard pendingOperationCount < Self.maximumPendingOperations else {
+      throw CodeMirrorSessionError.timeout
+    }
     let requestID = UUID()
     return try await withCheckedThrowingContinuation { continuation in
       let pending = PendingFormat(continuation: continuation, replicaID: replicaID)
@@ -783,6 +793,7 @@ public final class CodeMirrorSession {
       finishPendingRouteCommand(requestID, with: .invalidated)
     }
     replicas.removeAll()
+    acceptedRevisions.removeAll()
     replicaAppearances.removeAll()
     lastSentConfigurations.removeAll()
     for replicaID in Array(commandContexts.keys) {
@@ -806,6 +817,7 @@ public final class CodeMirrorSession {
       clearCommandContext(replicaID: replicaID, loadID: oldReplica.loadID)
       replicas.removeValue(forKey: replicaID)
     }
+    acceptedRevisions.removeValue(forKey: replicaID)
     replicaAppearances.removeValue(forKey: replicaID)
     clearCommandContext(replicaID: replicaID)
     lastSentConfigurations[replicaID] = configuration
@@ -821,6 +833,7 @@ public final class CodeMirrorSession {
     removeReplicaFromPendingOperations(replicaID)
     clearCommandContext(replicaID: replicaID, loadID: loadID)
     replicas.removeValue(forKey: replicaID)
+    acceptedRevisions.removeValue(forKey: replicaID)
     replicaAppearances.removeValue(forKey: replicaID)
     lastSentConfigurations.removeValue(forKey: replicaID)
   }
