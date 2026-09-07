@@ -33,6 +33,37 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     let targetIsHostedRouter: Bool
   }
 
+  private struct FindState: Equatable {
+    let value: String
+    let activeElement: String
+  }
+
+  private struct FindMenuObservation: Equatable {
+    let find: FindState
+    let fieldEqualsPreFind: Bool
+    let fieldUTF16Length: Int
+    let windowCanUndo: Bool
+    let windowCanRedo: Bool
+    let responderCanUndo: Bool
+    let responderCanRedo: Bool
+    let windowUndoManager: String
+    let responderUndoManager: String
+    let groupingLevel: Int
+    let undoActionName: String
+    let redoActionName: String
+    let ownerReplacementCount: Int
+    let ownerCommandPhases: [String]
+    let eventCount: Int
+    let routeResultCount: Int
+    let snapshot: CodeMirrorSnapshot
+    let transactionCount: Int
+  }
+
+  private struct FindMenuAttempt {
+    let enabled: Bool
+    let attempted: Bool
+  }
+
   private final class Evaluation {
     private var continuation: CheckedContinuation<String, Error>?
     private var finished = false
@@ -52,15 +83,19 @@ final class HostedF4CommandRoutingTests: XCTestCase {
 
   @MainActor
   private final class UndoOwner {
+    private static let documentActionName = "Document Edit"
+
     let name: String
     let undoManager = UndoManager()
+    private let trace: HostedPhaseTrace
     private let target = NSObject()
     private(set) var commandPhases: [String] = []
     private(set) var replacementCount = 0
     private(set) var errors: [Error] = []
 
-    init(name: String) {
+    init(name: String, trace: HostedPhaseTrace) {
       self.name = name
+      self.trace = trace
     }
 
     func handle(_ command: CodeMirrorCommand) {
@@ -78,6 +113,20 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       session: CodeMirrorSession,
       replicaID: CodeMirrorReplicaID
     ) {
+      let isDirectDocumentRegistration = !undoManager.isUndoing && !undoManager.isRedoing
+      let beforeBegin = undoManager.groupingLevel
+      var afterBegin = beforeBegin
+      if isDirectDocumentRegistration {
+        trace.record("document.\(name).group.begin.before", details: traceDetails)
+        undoManager.beginUndoGrouping()
+        afterBegin = undoManager.groupingLevel
+        trace.record(
+          "document.\(name).group.begin.after",
+          details: traceDetails.merging([
+            "beforeBegin": String(beforeBegin),
+            "afterBegin": String(afterBegin),
+          ]) { _, new in new })
+      }
       undoManager.registerUndo(withTarget: target) { [weak self, weak session] _ in
         guard let self, let session else { return }
         self.commandPhases.append(
@@ -105,7 +154,31 @@ final class HostedF4CommandRoutingTests: XCTestCase {
           self.errors.append(error)
         }
       }
+      if isDirectDocumentRegistration {
+        let beforeEnd = undoManager.groupingLevel
+        trace.record("document.\(name).group.end.before", details: traceDetails)
+        undoManager.endUndoGrouping()
+        let afterEnd = undoManager.groupingLevel
+        trace.record(
+          "document.\(name).group.end.after",
+          details: traceDetails.merging([
+            "beforeBegin": String(beforeBegin),
+            "afterBegin": String(afterBegin),
+            "beforeEnd": String(beforeEnd),
+            "afterEnd": String(afterEnd),
+          ]) { _, new in new })
+        XCTAssertEqual(afterEnd, beforeEnd - 1)
+        undoManager.setActionName(Self.documentActionName)
+      }
       _ = current
+    }
+
+    var traceDetails: [String: String] {
+      [
+        "groupingLevel": String(undoManager.groupingLevel),
+        "undoActionName": undoManager.undoActionName,
+        "redoActionName": undoManager.redoActionName,
+      ]
     }
   }
 
@@ -129,6 +202,11 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     }
   }
 
+  @MainActor
+  private final class ContextWindowMap {
+    var values: [CodeMirrorReplicaID: NSWindow] = [:]
+  }
+
   func testContentMenuAndKeyboardRouteToTheOwningUndoManager() async throws {
     let trace = HostedPhaseTrace(suffix: "f4-content-menu")
     trace.record(
@@ -139,16 +217,18 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       return
     }
 
-    let ownerA = UndoOwner(name: "windowA")
-    let ownerB = UndoOwner(name: "windowB")
+    let ownerA = UndoOwner(name: "windowA", trace: trace)
+    let ownerB = UndoOwner(name: "windowB", trace: trace)
     let inlineID = CodeMirrorReplicaID()
     let detachedID = CodeMirrorReplicaID()
     let otherID = CodeMirrorReplicaID()
     var eventsA: [(CodeMirrorReplicaID, CodeMirrorCommand)] = []
     var eventsB: [(CodeMirrorReplicaID, CodeMirrorCommand)] = []
     var routeResultsA: [CodeMirrorCommandRoutingResult] = []
+    var detachedRouteResultsA: [CodeMirrorCommandRoutingResult] = []
     var transactionsA = 0
     var transactionsB = 0
+    let contextWindows = ContextWindowMap()
 
     let sessionA = CodeMirrorSession(initialText: "one") { event in
       switch event {
@@ -157,6 +237,11 @@ final class HostedF4CommandRoutingTests: XCTestCase {
         ownerA.handle(command)
       case .transaction:
         transactionsA += 1
+      case .commandContextChanged(let replicaID):
+        if let window = contextWindows.values[replicaID] {
+          application.commandRouterRegistry.commandContextDidChange(
+            in: window, replicaID: replicaID)
+        }
       default:
         break
       }
@@ -169,6 +254,11 @@ final class HostedF4CommandRoutingTests: XCTestCase {
         ownerB.handle(command)
       case .transaction:
         transactionsB += 1
+      case .commandContextChanged(let replicaID):
+        if let window = contextWindows.values[replicaID] {
+          application.commandRouterRegistry.commandContextDidChange(
+            in: window, replicaID: replicaID)
+        }
       default:
         break
       }
@@ -212,6 +302,9 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     windowA.contentView = containerA
     windowB.contentView = containerB
     detachedWindow.contentView = detachedContainer
+    contextWindows.values[inlineID] = windowA
+    contextWindows.values[detachedID] = detachedWindow
+    contextWindows.values[otherID] = windowB
     containerA.addSubview(fieldA)
     containerA.addSubview(inlineWebView)
     detachedContainer.addSubview(detachedWebView)
@@ -242,6 +335,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       trace.record("routerA.inline.result", details: ["result": result.rawValue])
     }
     routerADetached.onResult = { result in
+      detachedRouteResultsA.append(result)
       trace.record("routerA.detached.result", details: ["result": result.rawValue])
     }
     routerAInline.onError = { error in
@@ -286,7 +380,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     }
     try await activate(windowA)
     try await focusContent(inlineWebView, in: windowA, session: sessionA, replicaID: inlineID)
-    XCTAssertEqual(sessionA.focusedEditorContentReplicaID(), inlineID)
+    XCTAssertEqual(sessionA.focusedCommandContext(), .content(inlineID))
 
     let initiallyDisabled = dispatch(
       menu.undoItem, window: windowA, trace: trace, phase: "menu.content.initial")
@@ -318,13 +412,36 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     try await activate(detachedWindow)
     try await focusContent(
       detachedWebView, in: detachedWindow, session: sessionA, replicaID: detachedID)
-    XCTAssertEqual(sessionA.focusedEditorContentReplicaID(), detachedID)
+    XCTAssertEqual(sessionA.focusedCommandContext(), .content(detachedID))
     _ = try await sessionA.flush()
     let beforeMenuRedo = eventsA.count
-    let menuRedo = dispatch(
-      menu.redoItem, window: detachedWindow, trace: trace, phase: "menu.content.redo")
-    XCTAssertTrue(menuRedo.enabled)
-    XCTAssertTrue(menuRedo.sent)
+    guard let editMenu = menu.redoItem.menu else {
+      XCTFail("Redo menu item has no owning Edit menu")
+      return
+    }
+    editMenu.update()
+    let redoIndex = editMenu.index(of: menu.redoItem)
+    let redoEnabled = menu.redoItem.isEnabled
+    trace.record(
+      "menu.content.redo.validated",
+      window: detachedWindow,
+      details: [
+        "menu": editMenu.title,
+        "index": String(redoIndex),
+        "enabled": String(redoEnabled),
+      ])
+    XCTAssertTrue(redoEnabled)
+    XCTAssertGreaterThanOrEqual(redoIndex, 0)
+    guard redoEnabled, redoIndex >= 0 else { return }
+    trace.record(
+      "menu.content.redo.attempt",
+      window: detachedWindow,
+      details: ["menu": editMenu.title, "index": String(redoIndex)])
+    editMenu.performActionForItem(at: redoIndex)
+    trace.record(
+      "menu.content.redo.after",
+      window: detachedWindow,
+      details: ["menu": editMenu.title, "index": String(redoIndex), "attempted": "true"])
     try await traceAwait(trace, "command.content.redo") {
       try await waitForCommandCount({ eventsA.count }, equals: beforeMenuRedo + 1)
     }
@@ -373,6 +490,21 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeNativeControls)
 
     try await focusContent(inlineWebView, in: windowA, session: sessionA, replicaID: inlineID)
+    let contentRearmBefore = try sessionA.snapshot()
+    send(Self.insertQuestion, to: windowA, trace: trace, phase: "keyboard.content.rearm.insert")
+    try await waitUntil("content rearm edit") {
+      guard let text = try? sessionA.snapshot().text else { return false }
+      return text != contentRearmBefore.text
+    }
+    _ = try await sessionA.flush()
+    let contentRearmAfter = try sessionA.snapshot()
+    ownerA.registerUndo(
+      from: contentRearmBefore, to: contentRearmAfter, session: sessionA, replicaID: inlineID)
+    trace.record("document.rearm.registration", details: ownerA.traceDetails)
+
+    let fieldValueBeforeFind = fieldA.stringValue
+    let fieldUTF16LengthBeforeFind = fieldValueBeforeFind.utf16.count
+    try await focusContent(inlineWebView, in: windowA, session: sessionA, replicaID: inlineID)
     menu.undoItem.menu?.update()
     let selectedRouter = menu.undoItem.action.flatMap {
       NSApp.target(forAction: $0, to: nil, from: menu.undoItem)
@@ -386,6 +518,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       script: "String(document.querySelector('.cm-search input')?.value ?? '')",
       equals: "q"
     )
+    trace.record("menu.find.actual.undo.grouping", details: ownerA.traceDetails)
     let eventsBeforeFind = eventsA.count
     let routeResultsBeforeFind = routeResultsA.count
     let documentTextBeforeFind = try sessionA.snapshot().text
@@ -393,8 +526,116 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     let ownerACommandPhasesBeforeFind = ownerA.commandPhases
     try await waitUntil("Find presentation focus") {
       sessionA.focusedReplicaID() == inlineID
-        && sessionA.focusedEditorContentReplicaID() == nil
+        && sessionA.focusedCommandContext() != nil
+        && !self.isContentContext(sessionA.focusedCommandContext(), replicaID: inlineID)
     }
+
+    let documentSnapshotBeforeFind = try sessionA.snapshot()
+    let transactionsBeforeFind = transactionsA
+    let observeCurrentFindMenuState: @MainActor () async throws -> FindMenuObservation = {
+      try await self.observeFindMenuState(
+        webView: inlineWebView,
+        window: windowA,
+        field: fieldA,
+        fieldValueBeforeFind: fieldValueBeforeFind,
+        owner: ownerA,
+        session: sessionA,
+        eventCount: eventsA.count,
+        routeResultCount: routeResultsA.count,
+        documentBaseline: documentSnapshotBeforeFind,
+        transactionCount: transactionsA
+      )
+    }
+
+    let actualFindUndoBefore = try await observeCurrentFindMenuState()
+    recordFindMenuState(
+      "menu.find.actual.undo.before",
+      observation: actualFindUndoBefore,
+      documentBaseline: documentSnapshotBeforeFind,
+      window: windowA,
+      trace: trace
+    )
+    XCTAssertEqual(actualFindUndoBefore.find.value, "q")
+    let actualFindUndo = performFindMenuAction(
+      menu.undoItem,
+      window: windowA,
+      trace: trace,
+      phase: "menu.find.actual.undo"
+    )
+    XCTAssertTrue(actualFindUndo.enabled)
+    XCTAssertTrue(actualFindUndo.attempted)
+    let actualFindUndoAfter = try await settleFindMenuAction(
+      "menu.find.actual.undo.settle",
+      before: actualFindUndoBefore,
+      expectedFindValue: "",
+      expectedRouteResultCount: routeResultsBeforeFind + 1,
+      observe: observeCurrentFindMenuState,
+      trace: trace
+    )
+    recordFindMenuState(
+      "menu.find.actual.undo.after",
+      observation: actualFindUndoAfter,
+      documentBaseline: documentSnapshotBeforeFind,
+      window: windowA,
+      trace: trace
+    )
+    XCTAssertEqual(actualFindUndoAfter.find.value, "")
+    assertFindMenuIsolation(
+      actualFindUndoAfter,
+      expectedFindValue: "",
+      documentBaseline: documentSnapshotBeforeFind,
+      baselineEventCount: eventsBeforeFind,
+      baselineRouteResultCount: routeResultsBeforeFind + 1,
+      baselineOwnerReplacementCount: ownerAReplacementsBeforeFind,
+      baselineOwnerCommandPhases: ownerACommandPhasesBeforeFind,
+      baselineTransactionCount: transactionsBeforeFind,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    let actualFindRedoBefore = try await observeCurrentFindMenuState()
+    recordFindMenuState(
+      "menu.find.actual.redo.before",
+      observation: actualFindRedoBefore,
+      documentBaseline: documentSnapshotBeforeFind,
+      window: windowA,
+      trace: trace
+    )
+    XCTAssertEqual(actualFindRedoBefore.find.value, "")
+    let actualFindRedo = performFindMenuAction(
+      menu.redoItem,
+      window: windowA,
+      trace: trace,
+      phase: "menu.find.actual.redo"
+    )
+    XCTAssertTrue(actualFindRedo.enabled)
+    XCTAssertTrue(actualFindRedo.attempted)
+    let actualFindRedoAfter = try await settleFindMenuAction(
+      "menu.find.actual.redo.settle",
+      before: actualFindRedoBefore,
+      expectedFindValue: "q",
+      expectedRouteResultCount: routeResultsBeforeFind + 2,
+      observe: observeCurrentFindMenuState,
+      trace: trace
+    )
+    recordFindMenuState(
+      "menu.find.actual.redo.after",
+      observation: actualFindRedoAfter,
+      documentBaseline: documentSnapshotBeforeFind,
+      window: windowA,
+      trace: trace
+    )
+    XCTAssertEqual(actualFindRedoAfter.find.value, "q")
+    assertFindMenuIsolation(
+      actualFindRedoAfter,
+      expectedFindValue: "q",
+      documentBaseline: documentSnapshotBeforeFind,
+      baselineEventCount: eventsBeforeFind,
+      baselineRouteResultCount: routeResultsBeforeFind + 2,
+      baselineOwnerReplacementCount: ownerAReplacementsBeforeFind,
+      baselineOwnerCommandPhases: ownerACommandPhasesBeforeFind,
+      baselineTransactionCount: transactionsBeforeFind,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
 
     send(Self.commandUndo, to: windowA, trace: trace, phase: "keyboard.find.undo")
     try await waitForDOMValue(
@@ -403,9 +644,21 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: ""
     )
     XCTAssertEqual(eventsA.count, eventsBeforeFind)
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 2)
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeFind)
     XCTAssertEqual(ownerA.replacementCount, ownerAReplacementsBeforeFind)
+    let rawInlineUndo = try await observeCurrentFindMenuState()
+    assertFindMenuIsolation(
+      rawInlineUndo,
+      expectedFindValue: "",
+      documentBaseline: documentSnapshotBeforeFind,
+      baselineEventCount: eventsBeforeFind,
+      baselineRouteResultCount: routeResultsBeforeFind + 2,
+      baselineOwnerReplacementCount: ownerAReplacementsBeforeFind,
+      baselineOwnerCommandPhases: ownerACommandPhasesBeforeFind,
+      baselineTransactionCount: transactionsBeforeFind,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
 
     send(Self.commandRedo, to: windowA, trace: trace, phase: "keyboard.find.redo")
     try await waitForDOMValue(
@@ -414,9 +667,21 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: "q"
     )
     XCTAssertEqual(eventsA.count, eventsBeforeFind)
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 2)
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeFind)
     XCTAssertEqual(ownerA.replacementCount, ownerAReplacementsBeforeFind)
+    let rawInlineRedo = try await observeCurrentFindMenuState()
+    assertFindMenuIsolation(
+      rawInlineRedo,
+      expectedFindValue: "q",
+      documentBaseline: documentSnapshotBeforeFind,
+      baselineEventCount: eventsBeforeFind,
+      baselineRouteResultCount: routeResultsBeforeFind + 2,
+      baselineOwnerReplacementCount: ownerAReplacementsBeforeFind,
+      baselineOwnerCommandPhases: ownerACommandPhasesBeforeFind,
+      baselineTransactionCount: transactionsBeforeFind,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
 
     trace.record(
       "menu.find.selected-router.before",
@@ -436,7 +701,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     XCTAssertTrue(findUndo)
     try await traceAwait(trace, "router.find.selected-cache-change") {
       try await waitUntil("embedded Find route result") {
-        routeResultsA.count == routeResultsBeforeFind + 1
+        routeResultsA.count == routeResultsBeforeFind + 3
       }
     }
     XCTAssertEqual(routeResultsA.last, .handledByEmbeddedControl)
@@ -464,7 +729,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: "q"
     )
     XCTAssertEqual(eventsA.count, eventsBeforeFind)
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 1)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 4)
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeFind)
 
     let findMenuUndo = performKeyEquivalent(
@@ -483,7 +748,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: ""
     )
     XCTAssertEqual(eventsA.count, eventsBeforeFind)
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 1)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 5)
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeFind)
 
     let findMenuRedoAgain = performKeyEquivalent(
@@ -502,7 +767,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: "q"
     )
     XCTAssertEqual(eventsA.count, eventsBeforeFind)
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 1)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeFind + 6)
     XCTAssertEqual(try sessionA.snapshot().text, documentTextBeforeFind)
     XCTAssertEqual(ownerA.replacementCount, ownerAReplacementsBeforeFind)
     XCTAssertEqual(ownerA.commandPhases, ownerACommandPhasesBeforeFind)
@@ -524,7 +789,207 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       ])
     XCTAssertFalse(targetWhileFind is HostedCommandRouter)
 
+    let detachedFindBaseline = try sessionA.snapshot()
+    let detachedFindTransactions = transactionsA
+    let detachedFindEvents = eventsA.count
+    let detachedFindReplacements = ownerA.replacementCount
+    let detachedFindPhases = ownerA.commandPhases
+    try await activate(detachedWindow)
+    _ = try await sessionA.showFind(in: detachedID)
+    try await focusFindInput(detachedWebView)
+    send(Self.insertFind, to: detachedWindow, trace: trace, phase: "keyboard.detached-find.insert")
+    try await waitForDOMValue(
+      detachedWebView,
+      script: "String(document.querySelector('.cm-search input')?.value ?? '')",
+      equals: "q"
+    )
+    try await waitUntil("detached Find presentation focus") {
+      sessionA.focusedReplicaID() == detachedID
+        && !self.isContentContext(sessionA.focusedCommandContext(), replicaID: detachedID)
+    }
+    let detachedFindResultsBefore = detachedRouteResultsA.count
+    let observeDetachedFind: @MainActor () async throws -> FindMenuObservation = {
+      try await self.observeFindMenuState(
+        webView: detachedWebView,
+        window: detachedWindow,
+        field: fieldA,
+        fieldValueBeforeFind: fieldValueBeforeFind,
+        owner: ownerA,
+        session: sessionA,
+        eventCount: eventsA.count,
+        routeResultCount: detachedRouteResultsA.count,
+        documentBaseline: detachedFindBaseline,
+        transactionCount: transactionsA
+      )
+    }
+    let detachedUndoBefore = try await observeDetachedFind()
+    let detachedUndo = performFindMenuAction(
+      menu.undoItem,
+      window: detachedWindow,
+      trace: trace,
+      phase: "menu.detached-find.undo"
+    )
+    XCTAssertTrue(detachedUndo.enabled)
+    XCTAssertTrue(detachedUndo.attempted)
+    let detachedUndoAfter = try await settleFindMenuAction(
+      "menu.detached-find.undo.settle",
+      before: detachedUndoBefore,
+      expectedFindValue: "",
+      expectedRouteResultCount: detachedFindResultsBefore + 1,
+      observe: observeDetachedFind,
+      trace: trace
+    )
+    assertFindMenuIsolation(
+      detachedUndoAfter,
+      expectedFindValue: "",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 1,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    let detachedRedoBefore = try await observeDetachedFind()
+    let detachedRedo = performFindMenuAction(
+      menu.redoItem,
+      window: detachedWindow,
+      trace: trace,
+      phase: "menu.detached-find.redo"
+    )
+    XCTAssertTrue(detachedRedo.enabled)
+    XCTAssertTrue(detachedRedo.attempted)
+    let detachedRedoAfter = try await settleFindMenuAction(
+      "menu.detached-find.redo.settle",
+      before: detachedRedoBefore,
+      expectedFindValue: "q",
+      expectedRouteResultCount: detachedFindResultsBefore + 2,
+      observe: observeDetachedFind,
+      trace: trace
+    )
+    assertFindMenuIsolation(
+      detachedRedoAfter,
+      expectedFindValue: "q",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 2,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    send(Self.commandUndo, to: detachedWindow, trace: trace, phase: "keyboard.detached-find.undo")
+    try await waitForDOMValue(
+      detachedWebView,
+      script: "String(document.querySelector('.cm-search input')?.value ?? '')",
+      equals: ""
+    )
+    XCTAssertEqual(detachedRouteResultsA.count, detachedFindResultsBefore + 2)
+    XCTAssertEqual(eventsA.count, detachedFindEvents)
+    XCTAssertEqual(try sessionA.snapshot(), detachedFindBaseline)
+    let rawDetachedUndo = try await observeDetachedFind()
+    assertFindMenuIsolation(
+      rawDetachedUndo,
+      expectedFindValue: "",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 2,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    send(Self.commandRedo, to: detachedWindow, trace: trace, phase: "keyboard.detached-find.redo")
+    try await waitForDOMValue(
+      detachedWebView,
+      script: "String(document.querySelector('.cm-search input')?.value ?? '')",
+      equals: "q"
+    )
+    XCTAssertEqual(detachedRouteResultsA.count, detachedFindResultsBefore + 2)
+    XCTAssertEqual(eventsA.count, detachedFindEvents)
+    XCTAssertEqual(try sessionA.snapshot(), detachedFindBaseline)
+    let rawDetachedRedo = try await observeDetachedFind()
+    assertFindMenuIsolation(
+      rawDetachedRedo,
+      expectedFindValue: "q",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 2,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    let detachedKeyEquivalentUndoBefore = try await observeDetachedFind()
+    let detachedKeyEquivalentUndo = performKeyEquivalent(
+      Self.commandUndo,
+      item: menu.undoItem,
+      window: detachedWindow,
+      trace: trace,
+      phase: "menu.detached-find.key-equivalent.undo"
+    )
+    XCTAssertTrue(detachedKeyEquivalentUndo.enabled)
+    XCTAssertTrue(detachedKeyEquivalentUndo.sent)
+    XCTAssertFalse(detachedKeyEquivalentUndo.targetIsHostedRouter)
+    let detachedKeyEquivalentUndoAfter = try await settleFindMenuAction(
+      "menu.detached-find.key-equivalent.undo.settle",
+      before: detachedKeyEquivalentUndoBefore,
+      expectedFindValue: "",
+      expectedRouteResultCount: detachedFindResultsBefore + 3,
+      observe: observeDetachedFind,
+      trace: trace
+    )
+    XCTAssertEqual(detachedRouteResultsA.last, .handledByEmbeddedControl)
+    assertFindMenuIsolation(
+      detachedKeyEquivalentUndoAfter,
+      expectedFindValue: "",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 3,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
+    let detachedKeyEquivalentRedoBefore = try await observeDetachedFind()
+    let detachedKeyEquivalentRedo = performKeyEquivalent(
+      Self.commandRedo,
+      item: menu.redoItem,
+      window: detachedWindow,
+      trace: trace,
+      phase: "menu.detached-find.key-equivalent.redo"
+    )
+    XCTAssertTrue(detachedKeyEquivalentRedo.enabled)
+    XCTAssertTrue(detachedKeyEquivalentRedo.sent)
+    XCTAssertFalse(detachedKeyEquivalentRedo.targetIsHostedRouter)
+    let detachedKeyEquivalentRedoAfter = try await settleFindMenuAction(
+      "menu.detached-find.key-equivalent.redo.settle",
+      before: detachedKeyEquivalentRedoBefore,
+      expectedFindValue: "q",
+      expectedRouteResultCount: detachedFindResultsBefore + 4,
+      observe: observeDetachedFind,
+      trace: trace
+    )
+    XCTAssertEqual(detachedRouteResultsA.last, .handledByEmbeddedControl)
+    assertFindMenuIsolation(
+      detachedKeyEquivalentRedoAfter,
+      expectedFindValue: "q",
+      documentBaseline: detachedFindBaseline,
+      baselineEventCount: detachedFindEvents,
+      baselineRouteResultCount: detachedFindResultsBefore + 4,
+      baselineOwnerReplacementCount: detachedFindReplacements,
+      baselineOwnerCommandPhases: detachedFindPhases,
+      baselineTransactionCount: detachedFindTransactions,
+      baselineFieldUTF16Length: fieldUTF16LengthBeforeFind
+    )
+
     try await traceAwait(trace, "focus.reverse-content") {
+      try await activate(windowA)
       try await focusContentWithoutPresentation(inlineWebView, in: windowA)
     }
     let eventsBeforeStaleTarget = eventsA.count
@@ -547,9 +1012,12 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       window: windowA,
       details: ["sent": String(staleTargetSent)])
     try await traceAwait(trace, "command.reverse-find-to-content.selected.settle") {
-      try await Task.sleep(nanoseconds: 25_000_000)
+      try await waitUntil("stale Find route result") {
+        routeResultsA.count == routeResultsBeforeStaleTarget + 1
+      }
     }
-    XCTAssertEqual(routeResultsA.count, routeResultsBeforeStaleTarget)
+    XCTAssertEqual(routeResultsA.count, routeResultsBeforeStaleTarget + 1)
+    XCTAssertEqual(routeResultsA.last, .unavailable)
     XCTAssertEqual(eventsA.count, eventsBeforeStaleTarget)
     XCTAssertEqual(ownerA.replacementCount, ownerAReplacementsBeforeStaleTarget)
     XCTAssertEqual(ownerA.commandPhases, ownerACommandPhasesBeforeStaleTarget)
@@ -566,7 +1034,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
 
     try await traceAwait(trace, "focus.reverse-content.presentation") {
       try await waitUntil("content presentation focus") {
-        sessionA.focusedEditorContentReplicaID() == inlineID
+        self.isContentContext(sessionA.focusedCommandContext(), replicaID: inlineID)
       }
     }
     let eventsBeforeReverseContent = eventsA.count
@@ -591,13 +1059,13 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     XCTAssertEqual(eventsA.last?.0, inlineID)
     XCTAssertEqual(eventsA.last?.1, .undo)
     XCTAssertEqual(routeResultsA.last, .forwardedToHost)
-    XCTAssertEqual(try sessionA.snapshot().text, "one")
+    XCTAssertEqual(try sessionA.snapshot().text, contentRearmBefore.text)
     XCTAssertEqual(ownerA.replacementCount, ownerAReplacementsBeforeFind + 1)
     XCTAssertEqual(
       ownerA.commandPhases,
       ownerACommandPhasesBeforeFind + ["windowA.undo"]
     )
-    XCTAssertEqual(transactionsA, transactionsAfterEditA)
+    XCTAssertEqual(transactionsA, transactionsBeforeFind)
 
     try await activate(windowB)
     try await focusContent(otherWebView, in: windowB, session: sessionB, replicaID: otherID)
@@ -606,6 +1074,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     try await waitForSnapshotText(sessionB, equals: "?one")
     _ = try await sessionB.flush()
     let afterEditB = try sessionB.snapshot()
+    let transactionsAfterEditB = transactionsB
     ownerB.registerUndo(from: beforeEditB, to: afterEditB, session: sessionB, replicaID: otherID)
     let beforeOwnerA = ownerA.commandPhases
     let beforeMenuB = eventsB.count
@@ -617,7 +1086,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     XCTAssertEqual(eventsB.last?.1, .undo)
     try await waitForSnapshotText(sessionB, equals: "one")
     XCTAssertEqual(ownerA.commandPhases, beforeOwnerA)
-    XCTAssertEqual(transactionsB, 0)
+    XCTAssertEqual(transactionsB, transactionsAfterEditB)
     XCTAssertTrue(ownerB.errors.isEmpty)
   }
 
@@ -636,6 +1105,215 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     editMenu.addItem(undoItem)
     editMenu.addItem(redoItem)
     return (mainMenu, undoItem, redoItem)
+  }
+
+  private func findState(in webView: WKWebView) async throws -> FindState {
+    let value = try await evaluateString(
+      webView,
+      script: "String(document.querySelector('.cm-search input')?.value ?? '')"
+    )
+    let activeElement = try await evaluateString(
+      webView,
+      script:
+        "String(document.activeElement === document.querySelector('.cm-search input') ? 'cm-search-input' : 'other')"
+    )
+    return FindState(value: value, activeElement: activeElement)
+  }
+
+  private func isContentContext(
+    _ context: CodeMirrorFocusedCommandContext?,
+    replicaID: CodeMirrorReplicaID
+  ) -> Bool {
+    if case .content(let focusedReplicaID) = context {
+      return focusedReplicaID == replicaID
+    }
+    return false
+  }
+
+  private func undoManagerRelationship(_ manager: UndoManager?, owner: UndoManager) -> String {
+    guard let manager else { return "none" }
+    return manager === owner ? "owner" : "other"
+  }
+
+  private func observeFindMenuState(
+    webView: WKWebView,
+    window: NSWindow,
+    field: NSTextField,
+    fieldValueBeforeFind: String,
+    owner: UndoOwner,
+    session: CodeMirrorSession,
+    eventCount: Int,
+    routeResultCount: Int,
+    documentBaseline: CodeMirrorSnapshot,
+    transactionCount: Int
+  ) async throws -> FindMenuObservation {
+    let find = try await findState(in: webView)
+    let snapshot = try session.snapshot()
+    let windowUndoManager = window.undoManager
+    let responderUndoManager = window.firstResponder?.undoManager
+    return FindMenuObservation(
+      find: find,
+      fieldEqualsPreFind: field.stringValue == fieldValueBeforeFind,
+      fieldUTF16Length: field.stringValue.utf16.count,
+      windowCanUndo: windowUndoManager?.canUndo ?? false,
+      windowCanRedo: windowUndoManager?.canRedo ?? false,
+      responderCanUndo: responderUndoManager?.canUndo ?? false,
+      responderCanRedo: responderUndoManager?.canRedo ?? false,
+      windowUndoManager: undoManagerRelationship(windowUndoManager, owner: owner.undoManager),
+      responderUndoManager: undoManagerRelationship(responderUndoManager, owner: owner.undoManager),
+      groupingLevel: owner.undoManager.groupingLevel,
+      undoActionName: owner.undoManager.undoActionName,
+      redoActionName: owner.undoManager.redoActionName,
+      ownerReplacementCount: owner.replacementCount,
+      ownerCommandPhases: owner.commandPhases,
+      eventCount: eventCount,
+      routeResultCount: routeResultCount,
+      snapshot: snapshot,
+      transactionCount: transactionCount
+    )
+  }
+
+  private func recordFindMenuState(
+    _ phase: String,
+    observation: FindMenuObservation,
+    documentBaseline: CodeMirrorSnapshot,
+    window: NSWindow,
+    trace: HostedPhaseTrace
+  ) {
+    trace.record(
+      phase,
+      window: window,
+      details: [
+        "findValue": observation.find.value,
+        "activeElement": observation.find.activeElement,
+        "fieldEqualsPreFind": String(observation.fieldEqualsPreFind),
+        "fieldUTF16Length": String(observation.fieldUTF16Length),
+        "windowCanUndo": String(observation.windowCanUndo),
+        "windowCanRedo": String(observation.windowCanRedo),
+        "responderCanUndo": String(observation.responderCanUndo),
+        "responderCanRedo": String(observation.responderCanRedo),
+        "windowUndoManager": observation.windowUndoManager,
+        "responderUndoManager": observation.responderUndoManager,
+        "groupingLevel": String(observation.groupingLevel),
+        "undoActionName": observation.undoActionName,
+        "redoActionName": observation.redoActionName,
+        "ownerReplacementCount": String(observation.ownerReplacementCount),
+        "ownerCommandPhases": observation.ownerCommandPhases.joined(separator: "|"),
+        "eventCount": String(observation.eventCount),
+        "routeResultCount": String(observation.routeResultCount),
+        "snapshotRevision": String(observation.snapshot.revision.rawValue),
+        "snapshotEqualBaseline": String(observation.snapshot == documentBaseline),
+        "transactionCount": String(observation.transactionCount),
+      ])
+  }
+
+  private func assertFindMenuIsolation(
+    _ observation: FindMenuObservation,
+    expectedFindValue: String,
+    documentBaseline: CodeMirrorSnapshot,
+    baselineEventCount: Int,
+    baselineRouteResultCount: Int,
+    baselineOwnerReplacementCount: Int,
+    baselineOwnerCommandPhases: [String],
+    baselineTransactionCount: Int,
+    baselineFieldUTF16Length: Int
+  ) {
+    XCTAssertEqual(observation.find.value, expectedFindValue)
+    XCTAssertEqual(observation.find.activeElement, "cm-search-input")
+    XCTAssertTrue(observation.fieldEqualsPreFind)
+    XCTAssertEqual(observation.fieldUTF16Length, baselineFieldUTF16Length)
+    XCTAssertEqual(observation.eventCount, baselineEventCount)
+    XCTAssertEqual(observation.routeResultCount, baselineRouteResultCount)
+    XCTAssertEqual(observation.ownerReplacementCount, baselineOwnerReplacementCount)
+    XCTAssertEqual(observation.ownerCommandPhases, baselineOwnerCommandPhases)
+    XCTAssertEqual(observation.snapshot.revision, documentBaseline.revision)
+    XCTAssertEqual(observation.snapshot, documentBaseline)
+    XCTAssertEqual(observation.transactionCount, baselineTransactionCount)
+  }
+
+  private func performFindMenuAction(
+    _ item: NSMenuItem,
+    window: NSWindow,
+    trace: HostedPhaseTrace,
+    phase: String
+  ) -> FindMenuAttempt {
+    guard let owningMenu = item.menu else {
+      XCTFail("Find menu item has no owning menu")
+      return FindMenuAttempt(enabled: false, attempted: false)
+    }
+    owningMenu.update()
+    let target = item.action.flatMap { NSApp.target(forAction: $0, to: nil, from: item) }
+    let index = owningMenu.index(of: item)
+    let enabled = item.isEnabled
+    let targetType = target.map { String(reflecting: type(of: $0)) } ?? "nil"
+    trace.record(
+      phase + ".validated",
+      window: window,
+      details: [
+        "menu": owningMenu.title,
+        "index": String(index),
+        "enabled": String(enabled),
+        "targetType": targetType,
+        "attempted": "false",
+      ])
+    guard enabled, index >= 0 else {
+      trace.record(
+        phase + ".after",
+        window: window,
+        details: [
+          "menu": owningMenu.title,
+          "index": String(index),
+          "enabled": String(enabled),
+          "targetType": targetType,
+          "attempted": "false",
+        ])
+      return FindMenuAttempt(enabled: enabled, attempted: false)
+    }
+    owningMenu.performActionForItem(at: index)
+    trace.record(
+      phase + ".after",
+      window: window,
+      details: [
+        "menu": owningMenu.title,
+        "index": String(index),
+        "enabled": String(enabled),
+        "targetType": targetType,
+        "attempted": "true",
+      ])
+    return FindMenuAttempt(enabled: enabled, attempted: true)
+  }
+
+  private func settleFindMenuAction(
+    _ phase: String,
+    before: FindMenuObservation,
+    expectedFindValue: String,
+    expectedRouteResultCount: Int,
+    observe: @escaping @MainActor () async throws -> FindMenuObservation,
+    trace: HostedPhaseTrace
+  ) async throws -> FindMenuObservation {
+    let deadline = DispatchTime.now().uptimeNanoseconds &+ 2_000_000_000
+    var current = try await observe()
+    while current.find.value != expectedFindValue
+      || current.routeResultCount != expectedRouteResultCount
+    {
+      guard DispatchTime.now().uptimeNanoseconds < deadline else {
+        trace.record(
+          phase + ".timeout",
+          details: [
+            "changed": String(current != before),
+            "findValueExpected": expectedFindValue,
+            "findValueObserved": current.find.value,
+            "routeResultCountExpected": String(expectedRouteResultCount),
+            "routeResultCountObserved": String(current.routeResultCount),
+            "timeout": "2000ms",
+          ])
+        return current
+      }
+      try await Task.sleep(nanoseconds: 25_000_000)
+      current = try await observe()
+    }
+    trace.record(phase + ".changed", details: ["changed": "true"])
+    return current
   }
 
   private func dispatch(
@@ -681,7 +1359,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
     configuration.websiteDataStore = .nonPersistent()
     configuration.userContentController = contentController
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-    return WKWebView(frame: frame, configuration: configuration)
+    return CodeMirrorWebView(frame: frame, configuration: configuration)
   }
 
   private func activate(_ window: NSWindow) async throws {
@@ -707,7 +1385,7 @@ final class HostedF4CommandRoutingTests: XCTestCase {
       equals: "true"
     )
     try await waitUntil("content focus scope") {
-      session.focusedEditorContentReplicaID() == replicaID
+      self.isContentContext(session.focusedCommandContext(), replicaID: replicaID)
     }
   }
 

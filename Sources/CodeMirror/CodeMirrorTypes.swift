@@ -203,6 +203,44 @@ public enum CodeMirrorCommandRoutingResult: String, Equatable, Hashable, Sendabl
   case unavailable
 }
 
+public struct CodeMirrorCommandAvailability: Equatable, Sendable {
+  public let isSupported: Bool
+  public let isEnabled: Bool
+
+  public init(isSupported: Bool, isEnabled: Bool) {
+    self.isSupported = isSupported
+    self.isEnabled = isEnabled
+  }
+}
+
+public struct CodeMirrorFindCommandContextID: Equatable, Hashable, Sendable {
+  internal let rawValue: UUID
+}
+
+public struct CodeMirrorFindCommandContext: Equatable, Sendable {
+  public let id: CodeMirrorFindCommandContextID
+  public let replicaID: CodeMirrorReplicaID
+  public let undo: CodeMirrorCommandAvailability
+  public let redo: CodeMirrorCommandAvailability
+}
+
+public enum CodeMirrorFocusedCommandContext: Equatable, Sendable {
+  case content(CodeMirrorReplicaID)
+  case find(CodeMirrorFindCommandContext)
+  case unavailable(CodeMirrorReplicaID)
+}
+
+public enum CodeMirrorCommandExpectation: Equatable, Sendable {
+  case contentOrCurrentFind
+  case find(CodeMirrorFindCommandContextID)
+}
+
+internal struct CodeMirrorRouteCommandRequest: Equatable, Sendable {
+  let command: CodeMirrorCommand
+  let expectedRevision: CodeMirrorRevision
+  let expectation: CodeMirrorCommandExpectation
+}
+
 public enum CodeMirrorSessionError: Error, Equatable, Sendable, Codable {
   case invalidated
   case replicaUnavailable
@@ -255,5 +293,6 @@ public enum CodeMirrorEvent: Sendable {
   case selection(
     replicaID: CodeMirrorReplicaID, revision: CodeMirrorRevision, selection: CodeMirrorSelection)
   case command(replicaID: CodeMirrorReplicaID, command: CodeMirrorCommand)
+  case commandContextChanged(replicaID: CodeMirrorReplicaID)
   case failure(replicaID: CodeMirrorReplicaID?, error: CodeMirrorSessionError)
 }

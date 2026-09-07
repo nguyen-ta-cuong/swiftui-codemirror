@@ -10,7 +10,7 @@ internal enum CodeMirrorHostCommand: Sendable {
   case acknowledge(revision: CodeMirrorRevision)
   case focus
   case showFind
-  case routeCommand(requestID: UUID, command: CodeMirrorCommand)
+  case routeCommand(requestID: UUID, request: CodeMirrorRouteCommandRequest)
   case format(requestID: UUID)
   case flush(requestID: UUID)
   case selection(CodeMirrorSelection)
@@ -22,9 +22,11 @@ internal enum CodeMirrorInboundMessage {
   case configured(sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID)
   case focusTraversal(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID, forward: Bool)
-  case focusScope(
+  case commandContext(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
-    sequence: UInt64, scope: CodeMirrorFocusScope)
+    revision: CodeMirrorRevision, sequence: UInt64, scope: CodeMirrorCommandContextScope,
+    findContextID: CodeMirrorFindCommandContextID?, undo: CodeMirrorCommandAvailability,
+    redo: CodeMirrorCommandAvailability)
   case transaction(CodeMirrorTransaction)
   case selection(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
@@ -35,7 +37,7 @@ internal enum CodeMirrorInboundMessage {
   case commandRouteResult(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID,
     revision: CodeMirrorRevision, requestID: UUID, command: CodeMirrorCommand,
-    result: CodeMirrorCommandRoutingResult)
+    expectation: CodeMirrorCommandExpectation, result: CodeMirrorCommandRoutingResult)
   case formatResult(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID, requestID: UUID,
     success: Bool)
@@ -55,10 +57,10 @@ internal enum CodeMirrorInboundMessage {
   }
 }
 
-internal enum CodeMirrorFocusScope: String, Equatable, Sendable {
+internal enum CodeMirrorCommandContextScope: String, Equatable, Sendable {
   case content
-  case embeddedControl
-  case other
+  case find
+  case unavailable
 }
 
 private struct WireSelection: Codable {
@@ -96,8 +98,15 @@ private struct WireMessage: Codable {
   let selection: WireSelection?
   let composition: WireComposition?
   let command: String?
-  let focusSequence: UInt64?
-  let focusScope: String?
+  let contextSequence: UInt64?
+  let commandScope: String?
+  let findContextID: String?
+  let undoSupported: Bool?
+  let undoEnabled: Bool?
+  let redoSupported: Bool?
+  let redoEnabled: Bool?
+  let expectedRevision: UInt64?
+  let expectation: String?
   let result: String?
   let direction: String?
   let success: Bool?
@@ -127,16 +136,25 @@ private struct WireMessage: Codable {
         loadID: try loadID.required().uuid(),
         forward: direction == "next"
       )
-    case "focusScope":
-      guard let focusScope, let scope = CodeMirrorFocusScope(rawValue: focusScope) else {
+    case "commandContext":
+      guard let commandScope, let scope = CodeMirrorCommandContextScope(rawValue: commandScope),
+        let revision, let contextSequence,
+        let undoSupported, let undoEnabled, let redoSupported, let redoEnabled
+      else {
         throw CodeMirrorSessionError.transportFailure
       }
-      return .focusScope(
+      return .commandContext(
         sessionID: try sessionID.required().sessionID(),
         replicaID: try replicaID.required().replicaID(),
         loadID: try loadID.required().uuid(),
-        sequence: try focusSequence.required(),
-        scope: scope
+        revision: CodeMirrorRevision(revision),
+        sequence: contextSequence,
+        scope: scope,
+        findContextID: try findContextID.map { try $0.findContextID() },
+        undo: CodeMirrorCommandAvailability(
+          isSupported: undoSupported, isEnabled: undoEnabled),
+        redo: CodeMirrorCommandAvailability(
+          isSupported: redoSupported, isEnabled: redoEnabled)
       )
     case "transaction":
       return .transaction(try transaction())
@@ -172,6 +190,8 @@ private struct WireMessage: Codable {
         revision: CodeMirrorRevision(try revision.required()),
         requestID: try requestID.required().uuid(),
         command: command,
+        expectation: try decodeExpectation(
+          expectation: expectation, findContextID: findContextID),
         result: result
       )
     case "formatResult":
@@ -258,6 +278,20 @@ private struct WireMessage: Codable {
       throw CodeMirrorSessionError.malformedChange
     }
   }
+
+  private func decodeExpectation(
+    expectation: String?, findContextID: String?
+  ) throws -> CodeMirrorCommandExpectation {
+    switch expectation {
+    case "contentOrCurrentFind":
+      guard findContextID == nil else { throw CodeMirrorSessionError.transportFailure }
+      return .contentOrCurrentFind
+    case "find":
+      return .find(try findContextID.required().findContextID())
+    default:
+      throw CodeMirrorSessionError.transportFailure
+    }
+  }
 }
 
 extension Optional {
@@ -283,6 +317,10 @@ extension String {
 
   fileprivate func replicaID() throws -> CodeMirrorReplicaID {
     CodeMirrorReplicaID(try uuid())
+  }
+
+  fileprivate func findContextID() throws -> CodeMirrorFindCommandContextID {
+    CodeMirrorFindCommandContextID(rawValue: try uuid())
   }
 }
 
@@ -329,12 +367,21 @@ extension CodeMirrorHostCommand {
       return ["type": "focus"]
     case .showFind:
       return ["type": "showFind"]
-    case .routeCommand(let requestID, let command):
-      return [
+    case .routeCommand(let requestID, let request):
+      var payload: [String: Any] = [
         "type": "routeCommand",
         "requestID": requestID.uuidString,
-        "command": command.rawValue,
+        "command": request.command.rawValue,
+        "expectedRevision": NSNumber(value: request.expectedRevision.rawValue),
       ]
+      switch request.expectation {
+      case .contentOrCurrentFind:
+        payload["expectation"] = "contentOrCurrentFind"
+      case .find(let contextID):
+        payload["expectation"] = "find"
+        payload["findContextID"] = contextID.rawValue.uuidString.lowercased()
+      }
+      return payload
     case .format(let requestID):
       return ["type": "format", "requestID": requestID.uuidString]
     case .flush(let requestID):
@@ -401,7 +448,7 @@ public final class CodeMirrorSession {
   private var pendingRouteCommands: [UUID: PendingRouteCommand] = [:]
   private var replicaAppearances: [CodeMirrorReplicaID: CodeMirrorAppearance] = [:]
   private var lastSentConfigurations: [CodeMirrorReplicaID: CodeMirrorConfiguration] = [:]
-  private var focusScopes: [CodeMirrorReplicaID: FocusScopeReport] = [:]
+  private var commandContexts: [CodeMirrorReplicaID: CommandContextReport] = [:]
   private var isInvalidated = false
   private let onEvent: @MainActor (CodeMirrorEvent) -> CodeMirrorEventDisposition
 
@@ -413,10 +460,11 @@ public final class CodeMirrorSession {
     let operationDidFinish: @MainActor (CodeMirrorHostCommand) -> Void
   }
 
-  private struct FocusScopeReport {
+  private struct CommandContextReport {
     let loadID: UUID
     let sequence: UInt64
-    let scope: CodeMirrorFocusScope
+    let revision: CodeMirrorRevision
+    let context: CodeMirrorFocusedCommandContext
   }
 
   @MainActor
@@ -454,22 +502,19 @@ public final class CodeMirrorSession {
     let continuation: CheckedContinuation<CodeMirrorCommandRoutingResult, Error>
     let replicaID: CodeMirrorReplicaID
     let loadID: UUID
-    let revision: CodeMirrorRevision
-    let command: CodeMirrorCommand
+    let request: CodeMirrorRouteCommandRequest
     var timeoutTask: Task<Void, Never>?
 
     init(
       continuation: CheckedContinuation<CodeMirrorCommandRoutingResult, Error>,
       replicaID: CodeMirrorReplicaID,
       loadID: UUID,
-      revision: CodeMirrorRevision,
-      command: CodeMirrorCommand
+      request: CodeMirrorRouteCommandRequest
     ) {
       self.continuation = continuation
       self.replicaID = replicaID
       self.loadID = loadID
-      self.revision = revision
-      self.command = command
+      self.request = request
     }
   }
 
@@ -513,18 +558,56 @@ public final class CodeMirrorSession {
     return replicas.first(where: { $0.value.isFocused() })?.key
   }
 
-  public func focusedEditorContentReplicaID() -> CodeMirrorReplicaID? {
+  public func focusedCommandContext() -> CodeMirrorFocusedCommandContext? {
     guard !isInvalidated else { return nil }
-    return replicas.first { replicaID, replica in
-      replica.isFocused()
-        && focusScopes[replicaID]?.loadID == replica.loadID
-        && focusScopes[replicaID]?.scope == .content
-    }?.key
+    guard let (replicaID, replica) = replicas.first(where: { $0.value.isFocused() }) else {
+      return nil
+    }
+    guard let report = commandContexts[replicaID], report.loadID == replica.loadID,
+      report.revision == currentRevision
+    else {
+      return .unavailable(replicaID)
+    }
+    return report.context
+  }
+
+  private func setCommandContext(
+    replicaID: CodeMirrorReplicaID,
+    loadID: UUID,
+    revision: CodeMirrorRevision,
+    sequence: UInt64,
+    context: CodeMirrorFocusedCommandContext?
+  ) {
+    let previous = commandContexts[replicaID]?.context
+    if let context {
+      commandContexts[replicaID] = CommandContextReport(
+        loadID: loadID, sequence: sequence, revision: revision, context: context)
+    } else {
+      commandContexts.removeValue(forKey: replicaID)
+    }
+    guard previous != context else { return }
+    if case .invalidate = onEvent(.commandContextChanged(replicaID: replicaID)) {
+      invalidate()
+    }
+  }
+
+  private func clearCommandContext(replicaID: CodeMirrorReplicaID, loadID: UUID? = nil) {
+    guard let report = commandContexts[replicaID], loadID == nil || report.loadID == loadID else {
+      return
+    }
+    setCommandContext(
+      replicaID: replicaID,
+      loadID: report.loadID,
+      revision: report.revision,
+      sequence: report.sequence,
+      context: nil
+    )
   }
 
   public func routeCommand(
     _ command: CodeMirrorCommand,
-    in replicaID: CodeMirrorReplicaID
+    in replicaID: CodeMirrorReplicaID,
+    expecting expectation: CodeMirrorCommandExpectation
   ) async throws -> CodeMirrorCommandRoutingResult {
     await Task.yield()
     guard !isInvalidated else {
@@ -538,7 +621,8 @@ public final class CodeMirrorSession {
       throw CodeMirrorSessionError.timeout
     }
     let requestID = UUID()
-    let revision = currentRevision
+    let request = CodeMirrorRouteCommandRequest(
+      command: command, expectedRevision: currentRevision, expectation: expectation)
     return try await withTaskCancellationHandler(
       operation: {
         try await withCheckedThrowingContinuation {
@@ -551,14 +635,13 @@ public final class CodeMirrorSession {
             continuation: continuation,
             replicaID: replicaID,
             loadID: replica.loadID,
-            revision: revision,
-            command: command
+            request: request
           )
           pending.timeoutTask = timeoutTask { [weak self] in
             self?.finishPendingRouteCommand(requestID, with: .timeout)
           }
           pendingRouteCommands[requestID] = pending
-          replicas[replicaID]?.send(.routeCommand(requestID: requestID, command: command))
+          replicas[replicaID]?.send(.routeCommand(requestID: requestID, request: request))
         }
       },
       onCancel: { [weak self] in
@@ -702,7 +785,9 @@ public final class CodeMirrorSession {
     replicas.removeAll()
     replicaAppearances.removeAll()
     lastSentConfigurations.removeAll()
-    focusScopes.removeAll()
+    for replicaID in Array(commandContexts.keys) {
+      clearCommandContext(replicaID: replicaID)
+    }
   }
 
   internal func attach(
@@ -718,10 +803,11 @@ public final class CodeMirrorSession {
     if let oldReplica = replicas[replicaID] {
       oldReplica.send(.invalidate)
       removeReplicaFromPendingOperations(replicaID)
+      clearCommandContext(replicaID: replicaID, loadID: oldReplica.loadID)
       replicas.removeValue(forKey: replicaID)
     }
     replicaAppearances.removeValue(forKey: replicaID)
-    focusScopes.removeValue(forKey: replicaID)
+    clearCommandContext(replicaID: replicaID)
     lastSentConfigurations[replicaID] = configuration
     let loadID = UUID()
     replicas[replicaID] = ReplicaConnection(
@@ -733,15 +819,15 @@ public final class CodeMirrorSession {
   internal func detach(replicaID: CodeMirrorReplicaID, loadID: UUID) {
     guard replicas[replicaID]?.loadID == loadID else { return }
     removeReplicaFromPendingOperations(replicaID)
+    clearCommandContext(replicaID: replicaID, loadID: loadID)
     replicas.removeValue(forKey: replicaID)
     replicaAppearances.removeValue(forKey: replicaID)
     lastSentConfigurations.removeValue(forKey: replicaID)
-    focusScopes.removeValue(forKey: replicaID)
   }
 
   internal func clearFocusScope(replicaID: CodeMirrorReplicaID, loadID: UUID) {
     guard matches(replicaID: replicaID, loadID: loadID) else { return }
-    focusScopes.removeValue(forKey: replicaID)
+    clearCommandContext(replicaID: replicaID, loadID: loadID)
     failRouteCommands(for: replicaID, loadID: loadID, with: .replicaUnavailable)
   }
 
@@ -757,9 +843,20 @@ public final class CodeMirrorSession {
     case .focusTraversal(let sessionID, let replicaID, let loadID, let forward):
       receiveFocusTraversal(
         sessionID: sessionID, replicaID: replicaID, loadID: loadID, forward: forward)
-    case .focusScope(let sessionID, let replicaID, let loadID, let sequence, let scope):
-      receiveFocusScope(
-        sessionID: sessionID, replicaID: replicaID, loadID: loadID, sequence: sequence, scope: scope
+    case .commandContext(
+      let sessionID, let replicaID, let loadID, let revision, let sequence, let scope,
+      let findContextID, let undo, let redo
+    ):
+      receiveCommandContext(
+        sessionID: sessionID,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: revision,
+        sequence: sequence,
+        scope: scope,
+        findContextID: findContextID,
+        undo: undo,
+        redo: redo
       )
     case .transaction(let transaction):
       receiveTransaction(transaction)
@@ -772,7 +869,8 @@ public final class CodeMirrorSession {
         sessionID: sessionID, replicaID: replicaID, loadID: loadID, revision: revision,
         command: command)
     case .commandRouteResult(
-      let sessionID, let replicaID, let loadID, let revision, let requestID, let command, let result
+      let sessionID, let replicaID, let loadID, let revision, let requestID, let command,
+      let expectation, let result
     ):
       receiveCommandRouteResult(
         sessionID: sessionID,
@@ -781,6 +879,7 @@ public final class CodeMirrorSession {
         revision: revision,
         requestID: requestID,
         command: command,
+        expectation: expectation,
         result: result
       )
     case .formatResult(let sessionID, let replicaID, let loadID, let requestID, let success):
@@ -799,6 +898,7 @@ public final class CodeMirrorSession {
 
   internal func reportTransportFailure(replicaID: CodeMirrorReplicaID, loadID: UUID) {
     guard matches(replicaID: replicaID, loadID: loadID) else { return }
+    clearCommandContext(replicaID: replicaID, loadID: loadID)
     publishFailure(replicaID: replicaID, error: .transportFailure)
     failOperations(for: replicaID, with: .transportFailure)
   }
@@ -842,7 +942,7 @@ public final class CodeMirrorSession {
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID
   ) {
     guard sessionID == id, matches(replicaID: replicaID, loadID: loadID) else { return }
-    focusScopes.removeValue(forKey: replicaID)
+    clearCommandContext(replicaID: replicaID, loadID: loadID)
     let effectiveConfiguration = effectiveConfiguration(for: replicaID)
     lastSentConfigurations[replicaID] = effectiveConfiguration
     replicas[replicaID]?.send(
@@ -854,20 +954,46 @@ public final class CodeMirrorSession {
       ))
   }
 
-  private func receiveFocusScope(
+  private func receiveCommandContext(
     sessionID: CodeMirrorSessionID,
     replicaID: CodeMirrorReplicaID,
     loadID: UUID,
+    revision: CodeMirrorRevision,
     sequence: UInt64,
-    scope: CodeMirrorFocusScope
+    scope: CodeMirrorCommandContextScope,
+    findContextID: CodeMirrorFindCommandContextID?,
+    undo: CodeMirrorCommandAvailability,
+    redo: CodeMirrorCommandAvailability
   ) {
-    guard sessionID == id, matches(replicaID: replicaID, loadID: loadID) else { return }
-    if let previous = focusScopes[replicaID], previous.loadID == loadID,
+    guard sessionID == id, matches(replicaID: replicaID, loadID: loadID),
+      revision == currentRevision
+    else { return }
+    if let previous = commandContexts[replicaID], previous.loadID == loadID,
       sequence <= previous.sequence
     {
       return
     }
-    focusScopes[replicaID] = FocusScopeReport(loadID: loadID, sequence: sequence, scope: scope)
+    let context: CodeMirrorFocusedCommandContext
+    switch scope {
+    case .content:
+      guard findContextID == nil else { return }
+      context = .content(replicaID)
+    case .find:
+      guard let findContextID else { return }
+      context = .find(
+        CodeMirrorFindCommandContext(
+          id: findContextID, replicaID: replicaID, undo: undo, redo: redo))
+    case .unavailable:
+      guard findContextID == nil else { return }
+      context = .unavailable(replicaID)
+    }
+    setCommandContext(
+      replicaID: replicaID,
+      loadID: loadID,
+      revision: revision,
+      sequence: sequence,
+      context: context
+    )
   }
 
   private func receiveConfigured(
@@ -907,6 +1033,7 @@ public final class CodeMirrorSession {
       let proposedSnapshot = accepted.snapshot
       sourceText = proposedSnapshot.text
       currentRevision = accepted.transaction.revision
+      clearCommandContextsForRevisionChange()
       selections[accepted.transaction.replicaID] = accepted.transaction.selectionAfter
       remember(accepted.transaction)
       let disposition = onEvent(.transaction(accepted.transaction, snapshot: proposedSnapshot))
@@ -981,6 +1108,7 @@ public final class CodeMirrorSession {
     revision: CodeMirrorRevision,
     requestID: UUID,
     command: CodeMirrorCommand,
+    expectation: CodeMirrorCommandExpectation,
     result: CodeMirrorCommandRoutingResult
   ) {
     guard sessionID == id, matches(replicaID: replicaID, loadID: loadID),
@@ -990,11 +1118,16 @@ public final class CodeMirrorSession {
     }
     pending.timeoutTask?.cancel()
     replicas[pending.replicaID]?.operationDidFinish(
-      .routeCommand(requestID: requestID, command: pending.command))
+      .routeCommand(requestID: requestID, request: pending.request))
     guard pending.replicaID == replicaID, pending.loadID == loadID,
-      pending.revision == revision, revision == currentRevision, pending.command == command,
+      pending.request.expectedRevision == revision, revision == currentRevision,
+      pending.request.command == command, pending.request.expectation == expectation,
       replicas[replicaID]?.isFocused() == true
     else {
+      pending.continuation.resume(returning: .unavailable)
+      return
+    }
+    if case .find = pending.request.expectation, result == .forwardedToHost {
       pending.continuation.resume(returning: .unavailable)
       return
     }
@@ -1149,6 +1282,7 @@ public final class CodeMirrorSession {
     }
     sourceText = newText
     currentRevision = CodeMirrorRevision(currentRevision.rawValue + 1)
+    clearCommandContextsForRevisionChange()
     if let replicaID, let selection {
       selections[replicaID] = selection
     }
@@ -1166,6 +1300,12 @@ public final class CodeMirrorSession {
   {
     guard let appearance = replicaAppearances[replicaID] else { return configuration }
     return configuration.withAppearance(appearance)
+  }
+
+  private func clearCommandContextsForRevisionChange() {
+    for replicaID in Array(commandContexts.keys) {
+      clearCommandContext(replicaID: replicaID)
+    }
   }
 
   private func sendConfigurationIfChanged(for replicaID: CodeMirrorReplicaID) {
@@ -1348,7 +1488,7 @@ public final class CodeMirrorSession {
     guard let pending = pendingRouteCommands.removeValue(forKey: requestID) else { return }
     pending.timeoutTask?.cancel()
     replicas[pending.replicaID]?.operationDidFinish(
-      .routeCommand(requestID: requestID, command: pending.command))
+      .routeCommand(requestID: requestID, request: pending.request))
     pending.continuation.resume(throwing: error)
   }
 

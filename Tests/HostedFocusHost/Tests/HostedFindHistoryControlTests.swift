@@ -1,4 +1,5 @@
 import AppKit
+import CodeMirrorHostedFocusHost
 import Foundation
 import WebKit
 import XCTest
@@ -12,21 +13,6 @@ final class HostedFindHistoryControlTests: XCTestCase {
     let charactersIgnoringModifiers: String
     let keyCode: UInt16
     let modifiers: NSEvent.ModifierFlags
-  }
-
-  private struct HistoryObservation: Decodable {
-    let command: String
-    let activeElement: String
-    let inputValueBefore: String
-    let inputValueAfter: String
-    let queryCommandSupported: Bool
-    let queryCommandEnabled: Bool
-    let result: Bool
-  }
-
-  private enum HistoryCommand: String {
-    case undo
-    case redo
   }
 
   private final class Evaluation {
@@ -46,30 +32,87 @@ final class HostedFindHistoryControlTests: XCTestCase {
     }
   }
 
+  @MainActor
+  private final class DocumentUndoProbe {
+    let manager = UndoManager()
+    private let target = NSObject()
+    private(set) var invocationCount = 0
+
+    func seed() {
+      manager.registerUndo(withTarget: target) { [weak self] _ in
+        self?.invocationCount += 1
+      }
+      manager.setActionName("Document Edit")
+    }
+  }
+
+  @MainActor
+  private final class CommandWindow: NSWindow {
+    private let ownerUndoManager: UndoManager
+
+    init(contentRect: NSRect, undoManager: UndoManager) {
+      ownerUndoManager = undoManager
+      super.init(
+        contentRect: contentRect,
+        styleMask: [.titled, .closable],
+        backing: .buffered,
+        defer: false
+      )
+      isReleasedWhenClosed = false
+      title = "Find Isolation Control"
+    }
+
+    override var undoManager: UndoManager? {
+      ownerUndoManager
+    }
+  }
+
   private static let insertFind = KeyStroke(
     characters: "q",
     charactersIgnoringModifiers: "q",
     keyCode: 12,
     modifiers: []
   )
+  private static let commandUndo = KeyStroke(
+    characters: "z",
+    charactersIgnoringModifiers: "z",
+    keyCode: 6,
+    modifiers: [.command]
+  )
+  private static let commandRedo = KeyStroke(
+    characters: "Z",
+    charactersIgnoringModifiers: "Z",
+    keyCode: 6,
+    modifiers: [.command, .shift]
+  )
 
-  func testFindInputNativeHistoryControl() async throws {
-    guard let traceURL = traceURL(suffix: "find-history-control") else {
-      XCTFail("NW_HOSTED_TRACE_PATH is required for hosted history evidence")
+  func testFindHistoryUsesLocalWebViewHistoryWithoutNativeRegistration() async throws {
+    guard let traceURL = traceURL(suffix: "find-isolation") else {
+      XCTFail("NW_HOSTED_TRACE_PATH is required for Find isolation evidence")
       return
     }
-    let trace = HostedPhaseTrace(suffix: "find-history-control")
-    trace.record("test.entry", details: ["test": "testFindInputNativeHistoryControl"])
+    let trace = HostedPhaseTrace(suffix: "find-isolation")
+    trace.record(
+      "test.entry",
+      details: ["test": "testFindHistoryUsesLocalWebViewHistoryWithoutNativeRegistration"])
     guard
       FileManager.default.fileExists(atPath: traceURL.path),
       let traceContents = try? String(contentsOf: traceURL, encoding: .utf8),
       traceContents.contains("\"event\":\"test.entry\"")
     else {
-      XCTFail("hosted trace entry was not written to \(traceURL.path)")
+      XCTFail("hosted trace entry was not written to (traceURL.path)")
       return
     }
+    guard let application = NSApp as? HostedFocusHostApplication else {
+      XCTFail("host application did not use HostedFocusHostApplication")
+      return
+    }
+
     let source = "controlled editor source"
+    let undoProbe = DocumentUndoProbe()
+    undoProbe.seed()
     var hostCommandCount = 0
+    var routeResults: [CodeMirrorCommandRoutingResult] = []
     let session = CodeMirrorSession(initialText: source) { event in
       if case .command = event {
         hostCommandCount += 1
@@ -82,169 +125,287 @@ final class HostedFindHistoryControlTests: XCTestCase {
     let container = NSView(frame: NSRect(x: 0, y: 0, width: 720, height: 420))
     container.addSubview(webView)
     webView.frame = container.bounds
-    let window = NSWindow(
+    let window = CommandWindow(
       contentRect: NSRect(x: 100, y: 100, width: 720, height: 420),
-      styleMask: [.titled, .closable],
-      backing: .buffered,
-      defer: false
+      undoManager: undoProbe.manager
     )
-    window.isReleasedWhenClosed = false
-    window.title = "Find History Control"
     window.contentView = container
+    let router = HostedCommandRouter(
+      session: session,
+      replicaID: replicaID,
+      window: window,
+      undoManager: undoProbe.manager
+    )
+    router.onResult = { result in
+      routeResults.append(result)
+      trace.record("router.result", window: window, details: ["result": result.rawValue])
+    }
+    router.onError = { error in
+      trace.record("router.error", window: window, error: error)
+    }
+    application.commandRouterRegistry.register(router, for: window)
+    let menu = installEditMenu()
+    let previousMenu = NSApp.mainMenu
+    NSApp.mainMenu = menu.menu
     trace.record("session.window.construction.after", window: window)
     coordinator.attach(webView: webView)
     trace.record("coordinator.attach.after", window: window)
     defer {
       trace.record("cleanup.begin", window: window)
       coordinator.detach()
+      application.commandRouterRegistry.unregister(for: window)
       window.orderOut(nil)
       window.close()
+      NSApp.mainMenu = previousMenu
       trace.record("cleanup.end", window: window)
     }
+
+    XCTAssertNil(webView.undoManager)
+    XCTAssertTrue(window.undoManager === undoProbe.manager)
+    XCTAssertTrue(router.undoManager === undoProbe.manager)
 
     try await waitUntil("CodeMirror ready and configured") {
       coordinator.pageIsReady && coordinator.pageIsConfigured
     }
     trace.record("ready.configured.after", window: window)
-    trace.record("activation.before", window: window, details: activationDiagnostics())
-    let policyResult = NSApp.setActivationPolicy(.regular)
-    NSApp.unhide(nil)
-    let runningApplicationResult = NSRunningApplication.current.activate(options: [
-      .activateAllWindows, .activateIgnoringOtherApps,
-    ])
-    NSApp.activate(ignoringOtherApps: true)
-    window.makeKeyAndOrderFront(nil)
-    window.orderFrontRegardless()
-    let activationDetails = activationDiagnostics(
-      policyResult: policyResult,
-      runningApplicationResult: runningApplicationResult
-    )
-    trace.record("activation.after", window: window, details: activationDetails)
-    do {
-      try await waitUntil(
-        "ordinary window activation",
-        timeoutNanoseconds: 30_000_000_000
-      ) {
-        NSApp.isActive && window.isVisible && window.isKeyWindow
-      }
-      trace.record(
-        "activation.wait.after",
-        window: window,
-        details: activationDiagnostics(
-          policyResult: policyResult,
-          runningApplicationResult: runningApplicationResult
-        ))
-    } catch {
-      trace.record(
-        "activation.wait.error",
-        window: window,
-        details: activationDiagnostics(
-          policyResult: policyResult,
-          runningApplicationResult: runningApplicationResult
-        ),
-        error: error
-      )
-      throw error
-    }
+    try await activate(window, trace: trace)
     XCTAssertTrue(window.makeFirstResponder(webView))
-    try await waitUntil("web view native focus") { window.firstResponder === webView }
-
+    try await waitUntil("WebView native focus") { window.firstResponder === webView }
     try await session.showFind(in: replicaID)
-    let focusResult = try await waitForDOMValue(
+    _ = try await waitForDOMValue(
       webView,
-      script: """
-        (() => {
-          const input = document.querySelector('.cm-search input');
-          if (!input) { return 'missing'; }
-          input.focus();
-          return JSON.stringify({
-            activeElement: document.activeElement === input ? 'cm-search-input' :
-              (document.activeElement?.tagName ?? 'none')
-          });
-        })()
-        """,
-      equals: "cm-search-input"
+      script:
+        "(() => { const input = document.querySelector('.cm-search input'); input?.focus(); return String(document.activeElement === input); })()",
+      equals: "true"
     )
-    trace.record(
-      "focus.find.after",
-      window: window,
-      details: ["activeElement": focusResult, "hostCommandCount": String(hostCommandCount)])
+    try await waitUntil("Find command context") {
+      if case .find(let context) = session.focusedCommandContext() {
+        return context.replicaID == replicaID
+      }
+      return false
+    }
+    trace.record("find.focus.after", window: window)
 
-    send(Self.insertFind, to: window)
-    let insertedValue = try await waitForDOMValue(
+    trace.record("find.input-order.install.before", window: window)
+    try await installFindInputOrderProbe(webView)
+    trace.record("find.input-order.install.after", window: window)
+    send(Self.insertFind, to: window, trace: trace, phase: "find.insert")
+    _ = try await waitForDOMValue(
       webView,
       script: "String(document.querySelector('.cm-search input')?.value ?? '')",
       equals: "q"
     )
+    trace.record("find.input-order.export.before", window: window)
+    do {
+      let inputOrder = try await collectFindInputOrderProbe(webView)
+      var details = [
+        "inputOrderJSON": inputOrder,
+        "findContextSource": "native session presentation snapshot",
+        "findContextID": "unavailable",
+        "undoSupported": "unavailable",
+        "undoEnabled": "unavailable",
+        "jsLiveContextID": "unavailable: controller instance is not exposed",
+        "pendingGeneration": "unavailable: controller instance is not exposed",
+        "pendingPresent": "unavailable: controller instance is not exposed",
+        "retainedCurrentValue": "unavailable: controller instance is not exposed",
+      ]
+      if case .find(let context) = session.focusedCommandContext() {
+        details["findContextID"] = context.id.rawValue.uuidString
+        details["undoSupported"] = String(context.undo.isSupported)
+        details["undoEnabled"] = String(context.undo.isEnabled)
+      }
+      trace.record("find.input-order.export.after", window: window, details: details)
+    } catch {
+      trace.record("find.input-order.export.error", window: window, error: error)
+      throw error
+    }
+    let sourceAfterFind = try session.snapshot()
+    XCTAssertEqual(sourceAfterFind.text, source)
+    XCTAssertEqual(hostCommandCount, 0)
+    XCTAssertTrue(undoProbe.manager.canUndo)
+    let documentActionName = undoProbe.manager.undoMenuItemTitle
+    let editMenu = menu.undoItem.menu
+    XCTAssertNotNil(editMenu)
+    editMenu?.update()
+    XCTAssertTrue(menu.undoItem.isEnabled)
+    guard
+      let retainedFindTarget = NSApp.target(
+        forAction: #selector(HostedCommandRouter.undo(_:)),
+        to: nil,
+        from: menu.undoItem
+      )
+    else {
+      XCTFail("Find target was not registered in the native menu route")
+      return
+    }
     trace.record(
-      "native.insert.after",
+      "find.target.captured",
       window: window,
-      details: [
-        "activeElement": try await activeElementDescription(webView),
-        "findValue": insertedValue,
-        "hostCommandCount": String(hostCommandCount),
-      ])
-    XCTAssertEqual(insertedValue, "q")
+      details: ["targetType": String(reflecting: type(of: retainedFindTarget))]
+    )
+    XCTAssertFalse(retainedFindTarget is HostedCommandRouter)
+
+    send(Self.commandUndo, to: window, trace: trace, phase: "find.raw.undo")
+    _ = try await waitForDOMValue(
+      webView,
+      script: "String(document.querySelector('.cm-search input')?.value ?? '')",
+      equals: ""
+    )
+    try await waitUntil("Find raw Undo settles") {
+      hostCommandCount == 0 && routeResults.isEmpty
+    }
     XCTAssertEqual(try session.snapshot().text, source)
     XCTAssertEqual(hostCommandCount, 0)
+    XCTAssertEqual(undoProbe.invocationCount, 0)
+    XCTAssertTrue(undoProbe.manager.canUndo)
+    XCTAssertEqual(undoProbe.manager.undoMenuItemTitle, documentActionName)
+    editMenu?.update()
+    XCTAssertFalse(menu.undoItem.isEnabled)
 
-    let undo = try await executeFindHistoryCommand(.undo, in: webView)
-    trace.record(
-      "find.undo.after",
-      window: window,
-      details: [
-        "activeElement": undo.activeElement,
-        "beforeValue": undo.inputValueBefore,
-        "afterValue": undo.inputValueAfter,
-        "queryCommandSupported": String(undo.queryCommandSupported),
-        "queryCommandEnabled": String(undo.queryCommandEnabled),
-        "result": String(undo.result),
-        "hostCommandCount": String(hostCommandCount),
-      ])
-
-    let redo = try await executeFindHistoryCommand(.redo, in: webView)
-    trace.record(
-      "find.redo.after",
-      window: window,
-      details: [
-        "activeElement": redo.activeElement,
-        "beforeValue": redo.inputValueBefore,
-        "afterValue": redo.inputValueAfter,
-        "queryCommandSupported": String(redo.queryCommandSupported),
-        "queryCommandEnabled": String(redo.queryCommandEnabled),
-        "result": String(redo.result),
-        "hostCommandCount": String(hostCommandCount),
-      ])
-
-    XCTAssertEqual(undo.command, HistoryCommand.undo.rawValue)
-    XCTAssertEqual(undo.activeElement, "cm-search-input")
-    XCTAssertEqual(undo.inputValueBefore, "q")
-    XCTAssertTrue(
-      undo.queryCommandSupported,
-      "Find undo must be supported; trace contains the observed command state"
-    )
-    XCTAssertTrue(
-      undo.queryCommandEnabled,
-      "Find undo must be enabled; trace contains the observed command state"
-    )
-    XCTAssertTrue(undo.result, "Find undo must execute; trace contains the observed command state")
-    XCTAssertEqual(undo.inputValueAfter, "")
-
-    XCTAssertEqual(redo.command, HistoryCommand.redo.rawValue)
-    XCTAssertEqual(redo.activeElement, "cm-search-input")
-    XCTAssertEqual(redo.inputValueBefore, "")
-    XCTAssertTrue(
-      redo.queryCommandSupported,
-      "Find redo must be supported; trace contains the observed command state"
-    )
-    XCTAssertTrue(
-      redo.queryCommandEnabled,
-      "Find redo must be enabled; trace contains the observed command state"
-    )
-    XCTAssertTrue(redo.result, "Find redo must execute; trace contains the observed command state")
-    XCTAssertEqual(redo.inputValueAfter, "q")
+    send(Self.commandUndo, to: window, trace: trace, phase: "find.raw.empty.undo")
+    try await Task.sleep(nanoseconds: 100_000_000)
     XCTAssertEqual(try session.snapshot().text, source)
     XCTAssertEqual(hostCommandCount, 0)
+    XCTAssertEqual(undoProbe.invocationCount, 0)
+    XCTAssertTrue(undoProbe.manager.canUndo)
+
+    let sent = NSApp.sendAction(
+      #selector(HostedCommandRouter.undo(_:)),
+      to: retainedFindTarget,
+      from: menu.undoItem
+    )
+    XCTAssertTrue(sent)
+    try await waitUntil("retained Find target result") { routeResults.count == 1 }
+    XCTAssertEqual(routeResults, [.unavailable])
+    XCTAssertEqual(try session.snapshot().text, source)
+    XCTAssertEqual(hostCommandCount, 0)
+    XCTAssertEqual(undoProbe.invocationCount, 0)
+    XCTAssertTrue(undoProbe.manager.canUndo)
+
+    send(Self.commandRedo, to: window, trace: trace, phase: "find.raw.empty.redo")
+    try await Task.sleep(nanoseconds: 100_000_000)
+    XCTAssertEqual(try session.snapshot().text, source)
+    XCTAssertEqual(hostCommandCount, 0)
+    trace.record(
+      "find.isolation.after",
+      window: window,
+      details: [
+        "webViewUndoManager": webView.undoManager == nil ? "nil" : "present",
+        "windowUndoManager": window.undoManager === undoProbe.manager ? "owner" : "other",
+        "routerUndoManager": router.undoManager === undoProbe.manager ? "owner" : "other",
+        "ownerInvocationCount": String(undoProbe.invocationCount),
+        "hostCommandCount": String(hostCommandCount),
+        "routeResultCount": String(routeResults.count),
+      ])
+  }
+
+  private func installFindInputOrderProbe(_ webView: WKWebView) async throws {
+    let installed = try await evaluateString(
+      webView,
+      script: """
+        (() => {
+          const input = document.querySelector('.cm-search input');
+          if (!input || document.activeElement !== input) throw new Error('Find input is not focused');
+          if (globalThis.__hostedFindInputOrderProbe) throw new Error('Find order probe already installed');
+          const entries = [];
+          const timers = new Set();
+          let sequence = 0;
+          let beforeInputCount = 0;
+          let dropped = 0;
+          let active = true;
+          const record = (phase, metadata) => {
+            if (!active) return;
+            if (entries.length >= 32) { dropped += 1; return; }
+            entries.push({
+              sequence: ++sequence, phase, ...metadata,
+              currentDOMValue: input.value.slice(0, 64),
+              currentDOMValueUTF16Length: input.value.length,
+              exactInputFocused: document.activeElement === input
+            });
+          };
+          const observe = event => {
+            if (event.target !== input || document.activeElement !== input) return;
+            const metadata = {
+              eventSequence: sequence + 1,
+              inputType: String(event.inputType || '').slice(0, 64),
+              isTrusted: event.isTrusted,
+              defaultPrevented: event.defaultPrevented
+            };
+            record(event.type, metadata);
+            if (event.type !== 'beforeinput' || ++beforeInputCount > 8) return;
+            queueMicrotask(() => record('beforeinput.microtask', metadata));
+            const timer = setTimeout(() => {
+              timers.delete(timer);
+              record('beforeinput.timer', metadata);
+            }, 0);
+            timers.add(timer);
+          };
+          document.addEventListener('beforeinput', observe, { capture: true, passive: true });
+          document.addEventListener('input', observe, { capture: true, passive: true });
+          globalThis.__hostedFindInputOrderProbe = {
+            collect() {
+              return JSON.stringify({
+                entries, dropped, pendingTimerCount: timers.size,
+                currentDOMValue: input.value.slice(0, 64),
+                currentDOMValueUTF16Length: input.value.length,
+                exactInputFocused: document.activeElement === input
+              });
+            },
+            dispose() {
+              active = false;
+              document.removeEventListener('beforeinput', observe, true);
+              document.removeEventListener('input', observe, true);
+              for (const timer of timers) clearTimeout(timer);
+              timers.clear();
+            }
+          };
+          return 'installed';
+        })()
+        """
+    )
+    XCTAssertEqual(installed, "installed")
+  }
+
+  private func collectFindInputOrderProbe(_ webView: WKWebView) async throws -> String {
+    let value = try await webView.callAsyncJavaScript(
+      """
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const probe = globalThis.__hostedFindInputOrderProbe;
+      if (!probe) throw new Error('Find order probe is missing');
+      const output = probe.collect();
+      probe.dispose();
+      delete globalThis.__hostedFindInputOrderProbe;
+      return output;
+      """,
+      arguments: [:],
+      in: nil,
+      contentWorld: .page
+    )
+    guard let output = value as? String else {
+      throw NSError(
+        domain: "HostedFindHistoryControlTests",
+        code: 4,
+        userInfo: [NSLocalizedDescriptionKey: "Find input order was not a String"]
+      )
+    }
+    return output
+  }
+
+  private func installEditMenu() -> (menu: NSMenu, undoItem: NSMenuItem) {
+    let menu = NSMenu(title: "Main")
+    let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+    let editMenu = NSMenu(title: "Edit")
+    menu.addItem(editItem)
+    menu.setSubmenu(editMenu, for: editItem)
+    let undoItem = NSMenuItem(
+      title: "Undo", action: #selector(HostedCommandRouter.undo(_:)), keyEquivalent: "z")
+    undoItem.keyEquivalentModifierMask = [.command]
+    let redoItem = NSMenuItem(
+      title: "Redo", action: #selector(HostedCommandRouter.redo(_:)), keyEquivalent: "Z")
+    redoItem.keyEquivalentModifierMask = [.command, .shift]
+    editMenu.addItem(undoItem)
+    editMenu.addItem(redoItem)
+    return (menu, undoItem)
   }
 
   private func makeWebView(for coordinator: CodeMirrorEditorCoordinator) -> WKWebView {
@@ -254,10 +415,47 @@ final class HostedFindHistoryControlTests: XCTestCase {
     configuration.websiteDataStore = .nonPersistent()
     configuration.userContentController = contentController
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-    return WKWebView(frame: .zero, configuration: configuration)
+    return CodeMirrorWebView(frame: .zero, configuration: configuration)
   }
 
-  private func send(_ key: KeyStroke, to window: NSWindow) {
+  private func activate(_ window: NSWindow, trace: HostedPhaseTrace) async throws {
+    trace.record("activation.before", window: window)
+    let policyResult = NSApp.setActivationPolicy(.regular)
+    NSApp.unhide(nil)
+    let runningApplicationResult = NSRunningApplication.current.activate(options: [
+      .activateAllWindows, .activateIgnoringOtherApps,
+    ])
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
+    trace.record(
+      "activation.after",
+      window: window,
+      details: [
+        "setActivationPolicyRegular": String(policyResult),
+        "runningApplicationActivate": String(runningApplicationResult),
+        "nsAppActivate": "called",
+      ])
+    try await waitUntil("window activation", timeoutNanoseconds: 30_000_000_000) {
+      NSApp.isActive && window.isVisible && window.isKeyWindow
+    }
+    trace.record("activation.wait.after", window: window)
+  }
+
+  private func send(
+    _ key: KeyStroke,
+    to window: NSWindow,
+    trace: HostedPhaseTrace,
+    phase: String
+  ) {
+    trace.record(
+      phase + ".before",
+      window: window,
+      details: [
+        "keyCode": String(key.keyCode),
+        "characters": key.characters,
+        "charactersIgnoringModifiers": key.charactersIgnoringModifiers,
+      ])
     let timestamp = ProcessInfo.processInfo.systemUptime
     let keyDown = NSEvent.keyEvent(
       with: .keyDown,
@@ -287,174 +485,10 @@ final class HostedFindHistoryControlTests: XCTestCase {
     XCTAssertNotNil(keyUp)
     if let keyDown { NSApp.sendEvent(keyDown) }
     if let keyUp { NSApp.sendEvent(keyUp) }
-  }
-
-  private func activeElementDescription(_ webView: WKWebView) async throws -> String {
-    try await waitForDOMValue(
-      webView,
-      script: """
-        (() => {
-          const input = document.querySelector('.cm-search input');
-          if (!input) { return 'missing'; }
-          return document.activeElement === input ? 'cm-search-input' :
-            (document.activeElement?.tagName ?? 'none');
-        })()
-        """,
-      equals: "cm-search-input"
-    )
-  }
-
-  private func executeFindHistoryCommand(
-    _ command: HistoryCommand,
-    in webView: WKWebView
-  ) async throws -> HistoryObservation {
-    let script = """
-      const input = document.querySelector('.cm-search input');
-      const activeElement = document.activeElement === input
-        ? 'cm-search-input'
-        : (document.activeElement?.tagName ?? 'none');
-      const requestedCommand = command;
-      if (!input || document.activeElement !== input) {
-        return JSON.stringify({
-          command: requestedCommand,
-          activeElement,
-          inputValueBefore: input?.value ?? '',
-          inputValueAfter: input?.value ?? '',
-          queryCommandSupported: false,
-          queryCommandEnabled: false,
-          result: false
-        });
-      }
-      const inputValueBefore = input.value;
-      const queryCommandSupported = document.queryCommandSupported(requestedCommand);
-      const queryCommandEnabled = document.queryCommandEnabled(requestedCommand);
-      const result = document.execCommand(requestedCommand);
-      return JSON.stringify({
-        command: requestedCommand,
-        activeElement,
-        inputValueBefore,
-        inputValueAfter: input.value,
-        queryCommandSupported,
-        queryCommandEnabled,
-        result
-      });
-      """
-    let evaluation = Evaluation()
-    let json = try await withCheckedThrowingContinuation {
-      (continuation: CheckedContinuation<String, Error>) in
-      evaluation.start(continuation)
-      webView.callAsyncJavaScript(
-        script,
-        arguments: ["command": command.rawValue],
-        in: nil,
-        in: .page
-      ) { result in
-        Task { @MainActor in
-          switch result {
-          case .success(let value):
-            if let value = value as? String {
-              evaluation.finish(.success(value))
-            } else {
-              evaluation.finish(
-                .failure(
-                  NSError(
-                    domain: "HostedFindHistoryControlTests",
-                    code: 4,
-                    userInfo: [
-                      NSLocalizedDescriptionKey:
-                        "Find history JavaScript value was not a String"
-                    ])))
-            }
-          case .failure(let error):
-            evaluation.finish(.failure(error))
-          }
-        }
-      }
-    }
-    return try JSONDecoder().decode(HistoryObservation.self, from: Data(json.utf8))
-  }
-
-  private func traceURL(suffix: String) -> URL? {
-    let environment = ProcessInfo.processInfo.environment
-    guard
-      let path = environment["NW_HOSTED_TRACE_PATH"]
-        ?? environment["TEST_RUNNER_NW_HOSTED_TRACE_PATH"],
-      !path.isEmpty
-    else {
-      return nil
-    }
-
-    let baseURL = URL(fileURLWithPath: path)
-    let fileExtension = baseURL.pathExtension
-    let stem = baseURL.deletingPathExtension().path
-    let fileName =
-      fileExtension.isEmpty
-      ? "\(stem)-\(suffix)"
-      : "\(stem)-\(suffix).\(fileExtension)"
-    return URL(fileURLWithPath: fileName)
-  }
-
-  private func activationDiagnostics(
-    policyResult: Bool? = nil,
-    runningApplicationResult: Bool? = nil
-  ) -> [String: String] {
-    let runningApplication = NSRunningApplication.current
-    let bundle = Bundle.main
-    let hostBundleIdentifier = bundle.bundleIdentifier ?? "nil"
-    let hostApplications: String
-    if let bundleIdentifier = bundle.bundleIdentifier {
-      hostApplications = NSRunningApplication.runningApplications(
-        withBundleIdentifier: bundleIdentifier
-      )
-      .sorted { $0.processIdentifier < $1.processIdentifier }
-      .map { application in
-        "pid=\(application.processIdentifier),path=\(application.bundleURL?.path ?? application.executableURL?.path ?? "nil")"
-      }
-      .joined(separator: ";")
-    } else {
-      hostApplications = ""
-    }
-    let frontmostApplication = NSWorkspace.shared.frontmostApplication
-    var details = [
-      "processIdentifier": String(ProcessInfo.processInfo.processIdentifier),
-      "currentProcessIdentifier": String(runningApplication.processIdentifier),
-      "currentActivationPolicy": String(runningApplication.activationPolicy.rawValue),
-      "currentIsFinishedLaunching": String(runningApplication.isFinishedLaunching),
-      "currentIsTerminated": String(runningApplication.isTerminated),
-      "currentBundleURL": runningApplication.bundleURL?.path ?? "nil",
-      "currentExecutableURL": runningApplication.executableURL?.path ?? "nil",
-      "mainBundleURL": bundle.bundleURL.path,
-      "mainNSPrincipalClass": infoValue("NSPrincipalClass"),
-      "mainLSUIElement": infoValue("LSUIElement"),
-      "mainLSBackgroundOnly": infoValue("LSBackgroundOnly"),
-      "nsAppClass": String(reflecting: type(of: NSApp)),
-      "nsAppDelegateType": NSApp.delegate.map { String(reflecting: type(of: $0)) } ?? "nil",
-      "delegateDidFinishLaunching": launchCompletionState(),
-      "frontmostProcessIdentifier": frontmostApplication.map {
-        String($0.processIdentifier)
-      } ?? "nil",
-      "frontmostBundleIdentifier": frontmostApplication?.bundleIdentifier ?? "nil",
-      "hostBundleIdentifier": hostBundleIdentifier,
-      "hostRunningApplications": hostApplications,
-    ]
-    if let policyResult {
-      details["setActivationPolicyRegular"] = String(policyResult)
-    }
-    if let runningApplicationResult {
-      details["runningApplicationActivate"] = String(runningApplicationResult)
-    }
-    return details
-  }
-
-  private func infoValue(_ key: String) -> String {
-    String(describing: Bundle.main.object(forInfoDictionaryKey: key) ?? "nil")
-  }
-
-  private func launchCompletionState() -> String {
-    guard let delegate = NSApp.delegate as? NSObject else { return "unavailable" }
-    let selector = NSSelectorFromString("didFinishLaunching")
-    guard delegate.responds(to: selector) else { return "unreported" }
-    return String(describing: delegate.value(forKey: "didFinishLaunching"))
+    trace.record(
+      phase + ".after",
+      window: window,
+      details: ["keyDownCreated": String(keyDown != nil), "keyUpCreated": String(keyUp != nil)])
   }
 
   private func waitForDOMValue(
@@ -462,12 +496,12 @@ final class HostedFindHistoryControlTests: XCTestCase {
     script: String,
     equals expected: String
   ) async throws -> String {
-    let deadline = DispatchTime.now().uptimeNanoseconds &+ 3_000_000_000
+    let deadline = DispatchTime.now().uptimeNanoseconds &+ 5_000_000_000
     var lastValue = ""
     while DispatchTime.now().uptimeNanoseconds < deadline {
       lastValue = try await evaluateString(webView, script: script)
-      if lastValue == expected || (expected == "cm-search-input" && lastValue.contains(expected)) {
-        return expected == "cm-search-input" ? expected : lastValue
+      if lastValue == expected {
+        return lastValue
       }
       try await Task.sleep(nanoseconds: 25_000_000)
     }
@@ -492,7 +526,7 @@ final class HostedFindHistoryControlTests: XCTestCase {
         throw NSError(
           domain: "HostedFindHistoryControlTests",
           code: 2,
-          userInfo: [NSLocalizedDescriptionKey: "timed out waiting for \(description)"]
+          userInfo: [NSLocalizedDescriptionKey: "timed out waiting for (description)"]
         )
       }
       try await Task.sleep(nanoseconds: 25_000_000)
@@ -522,5 +556,24 @@ final class HostedFindHistoryControlTests: XCTestCase {
         }
       }
     }
+  }
+
+  private func traceURL(suffix: String) -> URL? {
+    let environment = ProcessInfo.processInfo.environment
+    guard
+      let path = environment["NW_HOSTED_TRACE_PATH"]
+        ?? environment["TEST_RUNNER_NW_HOSTED_TRACE_PATH"],
+      !path.isEmpty
+    else {
+      return nil
+    }
+    let baseURL = URL(fileURLWithPath: path)
+    let fileExtension = baseURL.pathExtension
+    let stem = baseURL.deletingPathExtension().path
+    let fileName =
+      fileExtension.isEmpty
+      ? "\(stem)-\(suffix)"
+      : "\(stem)-\(suffix).\(fileExtension)"
+    return URL(fileURLWithPath: fileName)
   }
 }

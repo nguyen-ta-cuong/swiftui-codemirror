@@ -33,9 +33,9 @@ The supported language values are `.text`, `.json`, `.xml`, and `.graphql`. JSON
 
 ## Native editing commands
 
-`focusedReplicaID()` includes embedded Find focus and is the native focus/Find routing query. `focusedEditorContentReplicaID()` is a conservative menu-presentation query; its cached DOM scope does not authorize Undo/Redo execution.
+`focusedReplicaID()` reports the native key-window owner, while `focusedCommandContext()` reports trusted content or exact Find focus and Find Undo/Redo availability. A native-focused replica without a current trusted report is `.unavailable`; native fields and unrelated responders remain outside the CodeMirror command context.
 
-For nil-target Undo/Redo, the host uses a weak per-window registration and fixed replica. After target resolution it revalidates native key-window and replica ownership plus real `UndoManager` availability, then awaits `routeCommand(_:in:)`. Native fields and ordinary Find retain normal responder-chain fallthrough.
+For nil-target Undo/Redo, the host uses a weak per-window registration and immutable content or Find targets. Content targets route with `.contentOrCurrentFind`; a retained Find target carries its opaque `CodeMirrorFindCommandContextID` and routes with `.find(...)`, so it cannot become document Undo after focus moves. Hosts must validate the current key window, replica, context identity, and availability before dispatching `routeCommand(_:in:expecting:)`; native fields use normal responder-chain fallthrough.
 
 `forwardedToHost` emits exactly one existing `CodeMirrorEvent.command`. The host sends that event through flush-before-Undo preparation and the shared document `UndoManager`; it must not perform a second Undo/Redo from the result. `handledByEmbeddedControl` performs only local Find history and emits no document command; `unavailable` emits none.
 

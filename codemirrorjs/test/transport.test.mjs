@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { CompletionContext } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import {
@@ -13,24 +14,37 @@ import {
   validateChanges
 } from "../codemirror.js";
 
-function makeController(initialText = "") {
+function makeController(initialText = "", Controller = EditorController) {
   const messages = [];
   const handlers = new Map();
   const documentHandlers = new Map();
-  const findInput = {};
+  const findInputNotifications = [];
+  const findInput = {
+    value: "",
+    selectionStart: 0,
+    selectionEnd: 0,
+    selectionDirection: "forward",
+    setSelectionRange(start, end, direction = "forward") {
+      this.selectionStart = start;
+      this.selectionEnd = end;
+      this.selectionDirection = direction;
+    },
+    dispatchEvent(event) {
+      documentHandlers.get(event.type)?.({ target: this, isTrusted: false });
+      findInputNotifications.push({ type: event.type, value: this.value });
+      return true;
+    }
+  };
   const documentRef = {
     body: null,
     activeElement: null,
     querySelector(selector) {
       return selector === ".cm-search input" ? findInput : null;
     },
-    queryCommandSupported() { return false; },
-    queryCommandEnabled() { return false; },
-    execCommand() { return false; },
     addEventListener(name, handler) { documentHandlers.set(name, handler); },
     removeEventListener(name) { documentHandlers.delete(name); }
   };
-  const controller = new EditorController(message => messages.push(message), documentRef);
+  const controller = new Controller(message => messages.push(message), documentRef);
   controller.sessionID = "session";
   controller.replicaID = "replica";
   controller.loadID = "load";
@@ -68,6 +82,7 @@ function makeController(initialText = "") {
     documentHandlers,
     documentRef,
     findInput,
+    findInputNotifications,
     handlers,
     messages,
     get text() { return state.doc.toString(); }
@@ -271,110 +286,621 @@ test("Ctrl-Tab traversal requests native focus movement in both directions", () 
   harness.controller.destroy();
 });
 
-test("routeCommand uses live Find history and never operates a stale or other focus", async () => {
+function dispatchFindInput(harness, nextValue, inputType = "insertText", selectionStart = nextValue.length) {
+  const { controller, documentHandlers, documentRef, findInput } = harness;
+  documentRef.activeElement = findInput;
+  documentHandlers.get("beforeinput")({
+    target: findInput,
+    inputType,
+    isTrusted: true,
+    preventDefault() {},
+    stopImmediatePropagation() {}
+  });
+  findInput.value = nextValue;
+  findInput.setSelectionRange(selectionStart, selectionStart);
+  documentHandlers.get("input")({ target: findInput, inputType, isTrusted: true });
+  return controller.findHistory;
+}
+
+function focusFindInput(harness) {
+  const { documentHandlers, documentRef, findInput } = harness;
+  documentRef.activeElement = findInput;
+  documentHandlers.get("focusin")({ target: findInput });
+}
+
+function makeFindController(t, Controller = EditorController) {
+  const harness = makeController("document source", Controller);
+  harness.controller.configured = true;
+  harness.controller.initializing = false;
+  harness.controller.installFocusHandlers();
+  harness.controller.installCommandContextHandlers();
+  focusFindInput(harness);
+  t.after(() => harness.controller.destroy());
+  return harness;
+}
+
+function beginFindInput(harness, overrides = {}) {
+  const event = {
+    target: harness.findInput,
+    inputType: "insertText",
+    isTrusted: true,
+    defaultPrevented: false,
+    preventDefault() { this.defaultPrevented = true; },
+    ...overrides
+  };
+  harness.documentHandlers.get("beforeinput")(event);
+  return event;
+}
+
+function assertFindHistoryBudget(controller) {
+  const history = controller.findHistory;
+  const snapshots = new Set([
+    history.current, ...history.undo, ...history.redo,
+    history.pendingBeforeInput?.before, history.compositionStart
+  ].filter(Boolean));
+  const units = [...snapshots].reduce((total, snapshot) => total + snapshot.value.length, 0);
+  assert.ok(units <= 1024 * 1024, `retained ${units} UTF-16 units`);
+  assert.equal(controller.findHistoryUnits(history), units);
+  assert.ok(history.undo.length + history.redo.length <= 32);
+}
+
+test("Find beforeinput synchronizes an immediate selection change without losing Undo", t => {
+  const harness = makeFindController(t);
+  const { controller, findInput } = harness;
+  dispatchFindInput(harness, "abcd");
+  findInput.setSelectionRange(1, 3, "backward");
+  dispatchFindInput(harness, "aXd", "insertText", 2);
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "abcd");
+  assert.deepEqual([findInput.selectionStart, findInput.selectionEnd, findInput.selectionDirection], [1, 3, "backward"]);
+  assert.equal(controller.performFindHistory("redo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "aXd");
+});
+
+test("Find canceled beforeinput expires and cannot pair with a later trusted input", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers } = harness;
+  dispatchFindInput(harness, "a");
+  beginFindInput(harness).preventDefault();
+  await Promise.resolve();
+  assert.notEqual(controller.findHistory.pendingBeforeInput, null);
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  findInput.value = "late";
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: true });
+  assert.equal(controller.findHistory.current.value, "late");
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  beginFindInput(harness, { defaultPrevented: true });
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+});
+
+test("Find canceled beforeinput reports a reconciled programmatic baseline", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, messages } = harness;
+  dispatchFindInput(harness, "a");
+  await Promise.resolve();
+  const previousContextID = controller.findContextID;
+  messages.length = 0;
+  findInput.value = "external";
+  beginFindInput(harness).preventDefault();
+  await waitForEventLoop();
+  assert.notEqual(controller.findContextID, previousContextID);
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(messages.at(-1)?.type, "commandContext");
+  assert.equal(messages.at(-1)?.findContextID, controller.findContextID);
+  assert.equal(messages.at(-1)?.undoEnabled, false);
+});
+
+test("Find untrusted and mismatched input retire pending transactions to a live baseline", t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers } = harness;
+  dispatchFindInput(harness, "a");
+  beginFindInput(harness);
+  beginFindInput(harness, { isTrusted: false });
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  beginFindInput(harness);
+  findInput.value = "untrusted";
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: false });
+  assert.equal(controller.findHistory.current.value, "untrusted");
+  assert.equal(controller.findHistory.undo.length, 0);
+  beginFindInput(harness);
+  findInput.value = "mismatched";
+  documentHandlers.get("input")({ target: findInput, inputType: "deleteContentBackward", isTrusted: true });
+  assert.equal(controller.findHistory.current.value, "mismatched");
+  assert.equal(controller.findHistory.undo.length, 0);
+});
+
+test("Find trusted input remains paired after the actual WebKit microtask boundary", async t => {
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  beginFindInput(harness);
+  const pending = controller.findHistory.pendingBeforeInput;
+  await Promise.resolve();
+  assert.equal(controller.findHistory.pendingBeforeInput, pending);
+  findInput.value = "q";
+  findInput.setSelectionRange(1, 1);
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: true });
+  assert.equal(controller.findBeforeInputExpiryTimer, null);
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  assert.equal(controller.findCommandAvailability("undo").isEnabled, true);
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "");
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.redo.length, 1);
+});
+
+test("Find pending task expiry rejects stale context, generation, and timer identities", t => {
+  const callbacks = new Map();
+  const active = new Set();
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    assert.equal(delay, 0);
+    const timer = {};
+    callbacks.set(timer, callback);
+    active.add(timer);
+    return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", timer => active.delete(timer));
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  beginFindInput(harness);
+  const first = controller.findHistory.pendingBeforeInput;
+  const firstTimer = controller.findBeforeInputExpiryTimer;
+  assert.equal(active.size, 1);
+  beginFindInput(harness);
+  const second = controller.findHistory.pendingBeforeInput;
+  const secondTimer = controller.findBeforeInputExpiryTimer;
+  assert.notEqual(second.generation, first.generation);
+  assert.equal(active.size, 1);
+  assert.equal(active.has(firstTimer), false);
+  callbacks.get(firstTimer)();
+  assert.equal(controller.findHistory.pendingBeforeInput, second);
+  assert.equal(controller.findBeforeInputExpiryTimer, secondTimer);
+  const oldContext = controller.findContextID;
+  documentHandlers.get("focusout")({ target: findInput });
+  assert.equal(active.size, 0);
+  focusFindInput(harness);
+  beginFindInput(harness);
+  const replacement = controller.findHistory.pendingBeforeInput;
+  const replacementTimer = controller.findBeforeInputExpiryTimer;
+  assert.notEqual(controller.findContextID, oldContext);
+  callbacks.get(secondTimer)();
+  assert.equal(controller.findHistory.pendingBeforeInput, replacement);
+  assert.equal(controller.findBeforeInputExpiryTimer, replacementTimer);
+  callbacks.get(replacementTimer)();
+  active.delete(replacementTimer);
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  assert.equal(controller.findBeforeInputExpiryTimer, null);
+  dispatchFindInput(harness, "q");
+  assert.equal(active.size, 0);
+  beginFindInput(harness);
+  const retiredTimer = controller.findBeforeInputExpiryTimer;
+  controller.resetFindHistory(findInput, controller.findSnapshot(findInput));
+  assert.equal(active.size, 0);
+  callbacks.get(retiredTimer)();
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  beginFindInput(harness);
+  const destroyedTimer = controller.findBeforeInputExpiryTimer;
+  controller.destroy();
+  assert.equal(active.size, 0);
+  callbacks.get(destroyedTimer)();
+  assert.equal(controller.findHistory, null);
+  assert.equal(controller.findBeforeInputExpiryTimer, null);
+});
+
+test("Find budgets include uniquely retained pending and composition snapshots", async t => {
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  dispatchFindInput(harness, "a".repeat(400000));
+  dispatchFindInput(harness, "b".repeat(400000));
+  beginFindInput(harness);
+  assert.equal(controller.findHistory.pendingBeforeInput.before, controller.findHistory.current);
+  assertFindHistoryBudget(controller);
+  documentHandlers.get("compositionstart")({ target: findInput });
+  assert.equal(controller.findHistory.compositionStart, controller.findHistory.current);
+  assertFindHistoryBudget(controller);
+  dispatchFindInput(harness, "c".repeat(400000), "insertCompositionText");
+  assertFindHistoryBudget(controller);
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.compositionStart.value[0], "b");
+  dispatchFindInput(harness, "d".repeat(700000), "insertCompositionText");
+  assertFindHistoryBudget(controller);
+  assert.equal(controller.findHistory.compositionStart, null);
+  assert.equal(controller.findCommandAvailability("undo").isEnabled, false);
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.current.value, findInput.value);
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  assertFindHistoryBudget(controller);
+});
+
+test("Find discards a pending transaction when live selection retention cannot fit", t => {
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  dispatchFindInput(harness, "a".repeat(700000));
+  beginFindInput(harness);
+  findInput.setSelectionRange(0, 1, "backward");
+  documentHandlers.get("selectionchange")();
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  assertFindHistoryBudget(controller);
+  findInput.value = "fresh";
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: true });
+  assert.equal(controller.findHistory.current.value, "fresh");
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+});
+
+test("Find oversized composition values are not retained and settle to a fresh bounded baseline", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers } = harness;
+  dispatchFindInput(harness, "a");
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "x".repeat(1024 * 1024 + 1), "insertCompositionText");
+  assert.equal(controller.findHistory.current, null);
+  assert.equal(controller.findHistory.compositionStart, null);
+  assertFindHistoryBudget(controller);
+  dispatchFindInput(harness, "bounded", "insertCompositionText");
+  assert.equal(controller.findCommandAvailability("undo").isEnabled, false);
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.current.value, "bounded");
+  assert.equal(controller.findHistory.undo.length, 0);
+  dispatchFindInput(harness, "bounded!");
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "bounded");
+  assertFindHistoryBudget(controller);
+});
+
+test("Find composition cancellation notifies Search with restored value and selection", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers, findInputNotifications } = harness;
+  dispatchFindInput(harness, "ab");
+  findInput.setSelectionRange(0, 1, "backward");
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "中b", "insertCompositionText", 1);
+  documentHandlers.get("compositioncancel")({ target: findInput });
+  await waitForEventLoop();
+  assert.deepEqual(findInputNotifications, [{ type: "input", value: "ab" }]);
+  assert.deepEqual([findInput.selectionStart, findInput.selectionEnd, findInput.selectionDirection], [0, 1, "backward"]);
+  assert.equal(controller.findHistory.current.value, "ab");
+  assert.equal(harness.text, "document source");
+  assert.equal(harness.messages.filter(message => message.type === "command").length, 0);
+});
+
+test("Find failed local application resets stacks and availability to observed live state", t => {
+  const harness = makeFindController(t);
+  const { controller, findInput } = harness;
+  dispatchFindInput(harness, "ab");
+  dispatchFindInput(harness, "abc");
+  const dispatch = findInput.dispatchEvent.bind(findInput);
+  findInput.dispatchEvent = event => {
+    const result = dispatch(event);
+    findInput.value = "interrupted";
+    findInput.setSelectionRange(2, 2);
+    return result;
+  };
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), false);
+  assert.equal(controller.findHistory.current.value, "interrupted");
+  assert.equal(controller.findHistory.current.selectionStart, 2);
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  assert.equal(controller.findCommandAvailability("undo").isEnabled, false);
+  assert.equal(controller.findCommandAvailability("redo").isEnabled, false);
+});
+
+test("Find failed cancellation selection restores only the observed baseline", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers, findInputNotifications } = harness;
+  dispatchFindInput(harness, "ab");
+  findInput.setSelectionRange(0, 1, "backward");
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "中b", "insertCompositionText", 1);
+  findInput.setSelectionRange = () => {};
+  documentHandlers.get("compositioncancel")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  assert.deepEqual(controller.findHistory.current, controller.findSnapshot(findInput));
+  assert.deepEqual(findInputNotifications, [{ type: "input", value: "ab" }]);
+});
+
+test("Find retired composition settlement cannot settle a replacement focus epoch", async t => {
+  const harness = makeFindController(t);
+  const { controller, findInput, documentHandlers } = harness;
+  dispatchFindInput(harness, "a");
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "old", "insertCompositionText");
+  documentHandlers.get("compositioncancel")({ target: findInput });
+  documentHandlers.get("focusout")({ target: findInput });
+  focusFindInput(harness);
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "new", "insertCompositionText");
+  await waitForEventLoop();
+  assert.equal(findInput.value, "new");
+  assert.equal(controller.findHistory.compositionActive, true);
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "old");
+});
+
+test("Find a newer composition generation survives an earlier settlement in the same context", async t => {
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  const contextID = controller.findContextID;
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "first", "insertCompositionText");
+  documentHandlers.get("compositionend")({ target: findInput });
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "second", "insertCompositionText");
+  await waitForEventLoop();
+  assert.equal(controller.findContextID, contextID);
+  assert.equal(controller.findHistory.compositionActive, true);
+  assert.equal(controller.findHistory.current.value, "second");
+  assert.equal(controller.findHistory.undo.length, 0);
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.performFindHistory("undo", findInput, contextID), true);
+  assert.equal(findInput.value, "first");
+});
+
+test("Find final composition input stays paired across compositionend", async t => {
+  const harness = makeFindController(t);
+  const { controller, documentHandlers, findInput } = harness;
+  dispatchFindInput(harness, "a");
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "a中", "insertCompositionText");
+  beginFindInput(harness, { inputType: "insertFromComposition" });
+  documentHandlers.get("compositionend")({ target: findInput });
+  findInput.value = "a中文";
+  findInput.setSelectionRange(3, 3);
+  documentHandlers.get("input")({ target: findInput, inputType: "insertFromComposition", isTrusted: true });
+  await waitForEventLoop();
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "a");
+  assert.equal(controller.performFindHistory("redo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "a中文");
+});
+
+test("the generated controller executes bounded pairing, cancellation notification, and failed-apply recovery", async t => {
+  const bundle = await readFile(new URL("../../Sources/CodeMirror/web.bundle/codemirror.bundle.js", import.meta.url), "utf8");
+  const exports = {};
+  runInNewContext(bundle, {
+    exports, module: { exports }, crypto: globalThis.crypto, Event, setTimeout, clearTimeout
+  });
+  const harness = makeFindController(t, exports.EditorController);
+  const { controller, findInput, documentHandlers, findInputNotifications } = harness;
+  dispatchFindInput(harness, "ab");
+  findInput.setSelectionRange(0, 1, "backward");
+  dispatchFindInput(harness, "xb");
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "ab");
+  assert.equal(findInput.selectionStart, 0);
+  assert.equal(findInput.selectionDirection, "backward");
+  beginFindInput(harness);
+  await Promise.resolve();
+  assert.notEqual(controller.findHistory.pendingBeforeInput, null);
+  findInput.value = "ab!";
+  findInput.setSelectionRange(3, 3);
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: true });
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), true);
+  assert.equal(findInput.value, "ab");
+  beginFindInput(harness);
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.pendingBeforeInput, null);
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "中b", "insertCompositionText");
+  documentHandlers.get("compositioncancel")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(findInput.value, "ab");
+  assert.deepEqual(findInputNotifications.at(-1), { type: "input", value: "ab" });
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "x".repeat(1024 * 1024 + 1), "insertCompositionText");
+  assert.equal(controller.findHistory.current, null);
+  assertFindHistoryBudget(controller);
+  dispatchFindInput(harness, "baseline", "insertCompositionText");
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.undo.length, 0);
+  dispatchFindInput(harness, "baseline!");
+  findInput.setSelectionRange = () => { throw new Error("selection unavailable"); };
+  assert.equal(controller.performFindHistory("undo", findInput, controller.findContextID), false);
+  assert.equal(controller.findHistory.current.value, findInput.value);
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  assert.equal(harness.text, "document source");
+  assert.equal(harness.messages.filter(message => message.type === "command").length, 0);
+});
+
+test("Find local history routes paired input transactions and rejects empty immutable targets", async () => {
   const harness = makeController("one");
   const { controller, documentHandlers, documentRef, findInput, messages } = harness;
   controller.configured = true;
   controller.initializing = false;
-  documentRef.activeElement = controller.view.contentDOM;
   controller.installFocusHandlers();
-  controller.reportFocusScope(true);
-  assert.deepEqual(messages.at(-1), {
-    type: "focusScope",
-    focusSequence: 1,
-    focusScope: "content",
-    sessionID: "session",
-    replicaID: "replica",
-    loadID: "load"
-  });
-
-  controller.receive({ type: "routeCommand", requestID: "content-undo", command: "undo" });
-  assert.deepEqual(messages.at(-1), {
-    type: "commandRouteResult",
+  controller.installCommandContextHandlers();
+  documentRef.activeElement = controller.view.contentDOM;
+  controller.reportCommandContext(true);
+  controller.receive({
+    type: "routeCommand",
     requestID: "content-undo",
-    revision: 0,
     command: "undo",
-    result: "forwardedToHost",
-    sessionID: "session",
-    replicaID: "replica",
-    loadID: "load"
+    expectedRevision: 0,
+    expectation: "contentOrCurrentFind"
   });
+  assert.equal(messages.at(-1).result, "forwardedToHost");
 
-  documentRef.activeElement = findInput;
-  findInput.value = "q";
-  const historyCommands = [];
-  documentRef.queryCommandSupported = command => command === "undo";
-  documentRef.queryCommandEnabled = command => command === "undo" && findInput.value === "q";
-  documentRef.execCommand = command => {
-    historyCommands.push(command);
-    if (command === "undo" && findInput.value === "q") {
-      findInput.value = "";
-      return true;
-    }
-    return false;
-  };
-  controller.receive({ type: "routeCommand", requestID: "find-undo", command: "undo" });
-  assert.deepEqual(messages.at(-1), {
-    type: "commandRouteResult",
+  focusFindInput(harness);
+  dispatchFindInput(harness, "q");
+  await waitForEventLoop();
+  const findContextID = controller.findContextID;
+  controller.receive({
+    type: "routeCommand",
     requestID: "find-undo",
-    revision: 0,
     command: "undo",
-    result: "handledByEmbeddedControl",
-    sessionID: "session",
-    replicaID: "replica",
-    loadID: "load"
+    expectedRevision: 0,
+    expectation: "find",
+    findContextID
   });
-  assert.deepEqual(historyCommands, ["undo"]);
-  assert.equal(findInput.value, "");
-  assert.equal(messages.filter(message => message.type === "focusScope").length, 1);
-
-  documentHandlers.get("focusin")();
-  await waitForEventLoop();
-  assert.deepEqual(messages.at(-1), {
-    type: "focusScope",
-    focusSequence: 2,
-    focusScope: "embeddedControl",
-    sessionID: "session",
-    replicaID: "replica",
-    loadID: "load"
-  });
-
-  documentRef.queryCommandSupported = command => command === "redo";
-  documentRef.queryCommandEnabled = command => command === "redo" && findInput.value === "";
-  documentRef.execCommand = command => {
-    historyCommands.push(command);
-    if (command === "redo" && findInput.value === "") {
-      findInput.value = "q";
-      return true;
-    }
-    return false;
-  };
-  controller.receive({ type: "routeCommand", requestID: "find-redo", command: "redo" });
   assert.equal(messages.at(-1).result, "handledByEmbeddedControl");
-  assert.deepEqual(historyCommands, ["undo", "redo"]);
+  assert.equal(findInput.value, "");
+  controller.receive({
+    type: "routeCommand",
+    requestID: "find-empty-undo",
+    command: "undo",
+    expectedRevision: 0,
+    expectation: "find",
+    findContextID
+  });
+  assert.equal(messages.at(-1).result, "unavailable");
+  assert.equal(findInput.value, "");
+  controller.receive({
+    type: "routeCommand",
+    requestID: "find-redo",
+    command: "redo",
+    expectedRevision: 0,
+    expectation: "find",
+    findContextID
+  });
+  assert.equal(messages.at(-1).result, "handledByEmbeddedControl");
   assert.equal(findInput.value, "q");
 
-  documentRef.queryCommandSupported = command => command === "undo";
-  documentRef.queryCommandEnabled = () => true;
-  documentRef.execCommand = command => {
-    historyCommands.push(`${command}-failed`);
-    return false;
-  };
-  controller.receive({ type: "routeCommand", requestID: "find-undo-failed", command: "undo" });
-  assert.equal(messages.at(-1).result, "unavailable");
-  assert.deepEqual(historyCommands, ["undo", "redo", "undo-failed"]);
-  assert.equal(findInput.value, "q");
-
-  documentRef.activeElement = {};
-  documentHandlers.get("focusout")();
-  await waitForEventLoop();
-  controller.receive({ type: "routeCommand", requestID: "other-undo", command: "undo" });
-  assert.equal(messages.at(-1).result, "unavailable");
-  assert.equal(messages.filter(message => message.type === "command").length, 0);
+  const forgedMessages = messages.length;
+  controller.post({ type: "routeCommandResult", result: "forwardedToHost" });
+  assert.equal(messages.length, forgedMessages + 1);
+  documentRef.activeElement = controller.view.contentDOM;
+  documentHandlers.get("focusout")({ target: findInput });
+  controller.receive({
+    type: "routeCommand",
+    requestID: "other-undo",
+    command: "undo",
+    expectedRevision: 0,
+    expectation: "contentOrCurrentFind"
+  });
+  assert.equal(messages.at(-1).result, "forwardedToHost");
   assert.equal(harness.text, "one");
   controller.destroy();
   assert.equal(documentHandlers.size, 0);
-  assert.equal(harness.handlers.size, 0);
+});
+
+test("Find shortcuts consume empty history and never reach document commands", async () => {
+  const harness = makeController("");
+  const { controller, documentHandlers, documentRef, findInput, messages } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.installFocusHandlers();
+  controller.installCommandContextHandlers();
+  focusFindInput(harness);
+  const event = {
+    target: findInput,
+    key: "z",
+    metaKey: true,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    prevented: false,
+    stopped: false,
+    preventDefault() { this.prevented = true; },
+    stopImmediatePropagation() { this.stopped = true; }
+  };
+  documentHandlers.get("keydown")(event);
+  await waitForEventLoop();
+  assert.equal(event.prevented, true);
+  assert.equal(event.stopped, true);
+  assert.equal(messages.filter(message => message.type === "command").length, 0);
+  documentRef.activeElement = controller.view.contentDOM;
+  const contentEvent = { ...event, target: controller.view.contentDOM, prevented: false, stopped: false };
+  documentHandlers.get("keydown")(contentEvent);
+  assert.equal(contentEvent.prevented, false);
+  controller.destroy();
+});
+
+test("Find history batches composition, restores selection, and clears redo on new input", async () => {
+  const harness = makeController("");
+  const { controller, documentHandlers, documentRef, findInput, messages } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.installFocusHandlers();
+  controller.installCommandContextHandlers();
+  focusFindInput(harness);
+  dispatchFindInput(harness, "ab");
+  findInput.setSelectionRange(1, 1);
+  documentHandlers.get("selectionchange")();
+  dispatchFindInput(harness, "😀", "insertText", 2);
+  const selectionBeforeUndo = [findInput.selectionStart, findInput.selectionEnd];
+  assert.deepEqual(selectionBeforeUndo, [2, 2]);
+  controller.performFindHistory("undo", findInput, controller.findContextID);
+  assert.equal(findInput.value, "ab");
+  assert.deepEqual([findInput.selectionStart, findInput.selectionEnd], [1, 1]);
+  controller.performFindHistory("redo", findInput, controller.findContextID);
+  assert.equal(findInput.value, "😀");
+  assert.deepEqual([findInput.selectionStart, findInput.selectionEnd], [2, 2]);
+
+  documentHandlers.get("beforeinput")({ target: findInput, inputType: "insertText", isTrusted: true });
+  findInput.value = "x";
+  findInput.setSelectionRange(1, 1);
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText", isTrusted: true });
+  assert.equal(controller.findHistory.redo.length, 0);
+
+  const compositionStartValue = findInput.value;
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, `${compositionStartValue}中`, "insertCompositionText");
+  const undoCountBeforeComposition = controller.findHistory.undo.length;
+  documentHandlers.get("compositionend")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(controller.findHistory.undo.length, undoCountBeforeComposition + 1);
+  controller.performFindHistory("undo", findInput, controller.findContextID);
+  assert.equal(findInput.value, "x");
+  const undoCountBeforeCancellation = controller.findHistory.undo.length;
+  documentHandlers.get("compositionstart")({ target: findInput });
+  dispatchFindInput(harness, "xy", "insertCompositionText");
+  documentHandlers.get("compositioncancel")({ target: findInput });
+  await waitForEventLoop();
+  assert.equal(findInput.value, "x");
+  assert.equal(controller.findHistory.undo.length, undoCountBeforeCancellation);
+  assert.equal(messages.filter(message => message.type === "command").length, 0);
+  documentRef.activeElement = controller.view.contentDOM;
+  controller.destroy();
+});
+
+test("Find history adopts programmatic resets, retires on focus epoch, and enforces bounds", async () => {
+  const harness = makeController("");
+  const { controller, documentHandlers, documentRef, findInput } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.installFocusHandlers();
+  controller.installCommandContextHandlers();
+  focusFindInput(harness);
+  for (let index = 0; index < 40; index += 1) {
+    dispatchFindInput(harness, "x".repeat(index + 1));
+  }
+  assert.equal(controller.findHistory.undo.length, 32);
+  findInput.value = "programmatic";
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText" });
+  assert.equal(controller.findHistory.undo.length, 0);
+  assert.equal(controller.findHistory.redo.length, 0);
+  const oldContextID = controller.findContextID;
+  documentHandlers.get("focusout")({ target: findInput });
+  focusFindInput(harness);
+  assert.notEqual(controller.findContextID, oldContextID);
+  assert.equal(controller.findHistory.undo.length, 0);
+
+  findInput.value = "x".repeat(1048577);
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText" });
+  assert.equal(controller.findHistory.oversized, true);
+  assert.equal(controller.findHistory.current, null);
+  assert.equal(controller.findHistory.undo.length, 0);
+  controller.performFindHistory("undo", findInput, controller.findContextID);
+  assert.equal(findInput.value.length, 1048577);
+  findInput.value = "bounded";
+  documentHandlers.get("input")({ target: findInput, inputType: "insertText" });
+  assert.equal(controller.findHistory.oversized, false);
+  assert.equal(controller.findHistory.undo.length, 0);
+  documentRef.activeElement = controller.view.contentDOM;
+  controller.destroy();
+  assert.equal(controller.findHistory, null);
 });
 
 test("compositionend waits for the final CodeMirror update before flushing", async () => {
@@ -390,7 +916,7 @@ test("compositionend waits for the final CodeMirror update before flushing", asy
   applyLocalChange(controller, { changes: { from: 0, insert: "a" } });
   assert.equal(messages.some(message => message.type === "flushResult"), false);
   controller.acknowledge(1);
-  assert.deepEqual(messages.at(-1), { type: "flushResult", requestID: "flush", success: true, sessionID: "session", replicaID: "replica", loadID: "load" });
+  assert.deepEqual(messages.findLast(message => message.type === "flushResult"), { type: "flushResult", requestID: "flush", success: true, sessionID: "session", replicaID: "replica", loadID: "load" });
   controller.destroy();
 });
 
@@ -404,7 +930,7 @@ test("compositionend without a changed document settles on the next event-loop t
   handlers.get("compositionend")();
   assert.equal(messages.some(message => message.type === "flushResult"), false);
   await waitForEventLoop();
-  assert.deepEqual(messages.at(-1), {
+  assert.deepEqual(messages.findLast(message => message.type === "flushResult"), {
     type: "flushResult",
     requestID: "empty-composition",
     success: true,

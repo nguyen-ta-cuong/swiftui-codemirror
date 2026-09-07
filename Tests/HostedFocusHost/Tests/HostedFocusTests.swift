@@ -585,7 +585,7 @@ final class HostedFocusTests: XCTestCase {
     configuration.websiteDataStore = .nonPersistent()
     configuration.userContentController = contentController
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-    return WKWebView(frame: frame, configuration: configuration)
+    return CodeMirrorWebView(frame: frame, configuration: configuration)
   }
 
   private func activateWithTrace(_ window: NSWindow, phase: String) async throws {

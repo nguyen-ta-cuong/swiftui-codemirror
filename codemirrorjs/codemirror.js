@@ -10,6 +10,8 @@ import { openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { oneDark } from "@codemirror/theme-one-dark";
 
 export const MAX_ANALYSIS_BYTES = 1024 * 1024;
+const MAX_FIND_HISTORY_SNAPSHOTS = 32;
+const MAX_FIND_HISTORY_UNITS = 1024 * 1024;
 
 export function utf8ByteLength(value) {
   return new TextEncoder().encode(value).byteLength;
@@ -518,9 +520,19 @@ class EditorController {
     this.listenerCompartment = new Compartment();
     this.handlers = [];
     this.focusHandlers = [];
-    this.focusReportTimer = null;
-    this.focusSequence = 0;
-    this.reportedFocusScope = null;
+    this.commandContextHandlers = [];
+    this.commandContextTimer = null;
+    this.commandContextForcePending = false;
+    this.commandContextSequence = 0;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.findContextID = null;
+    this.findFocusActive = false;
+    this.findInput = null;
+    this.findHistory = null;
+    this.findCompositionSettlementTimer = null;
+    this.findBeforeInputExpiryTimer = null;
+    this.contextObserver = null;
   }
 
   mount() {
@@ -578,6 +590,7 @@ class EditorController {
     this.view.dom.setAttribute("aria-busy", "true");
     this.installCompositionHandlers();
     this.installFocusHandlers();
+    this.installCommandContextHandlers();
     this.post({ type: "ready" });
   }
 
@@ -620,11 +633,12 @@ class EditorController {
     case "showFind":
       if (this.view) {
         openSearchPanel(this.view);
-        this.scheduleFocusReport();
+        this.resetFindHistoryForPanelReopen();
+        this.scheduleCommandContextReport(true);
       }
       break;
     case "routeCommand":
-      this.routeCommand(command.requestID, command.command);
+      this.routeCommand(command);
       break;
     case "format":
       this.format(command.requestID);
@@ -653,8 +667,10 @@ class EditorController {
     this.hostRevision = Number(command.revision);
     this.localRevision = this.hostRevision;
     this.configuration = command.configuration;
-    this.focusSequence = 0;
-    this.reportedFocusScope = null;
+    this.commandContextSequence = 0;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.retireFindHistory();
     this.updateConfiguration(this.configuration);
     this.replaceDocument(command.text, command.selections, true);
     this.localEditBeforeConfiguration = false;
@@ -663,7 +679,7 @@ class EditorController {
     this.updateConfiguration(this.configuration);
     this.scheduleDiagnostics();
     this.post({ type: "configured" });
-    this.reportFocusScope(true);
+    this.scheduleCommandContextReport(true);
   }
 
   updateConfiguration(configuration) {
@@ -703,6 +719,7 @@ class EditorController {
     this.view.dom.style.setProperty("transition", this.configuration.appearance.reduceMotion ? "none" : "opacity 120ms ease");
     this.view.dom.style.setProperty("background", this.configuration.appearance.reduceTransparency ? "Canvas" : "transparent");
     this.scheduleDiagnostics();
+    this.scheduleCommandContextReport();
   }
 
   scheduleDiagnostics() {
@@ -745,6 +762,7 @@ class EditorController {
     }
     this.scheduleDiagnostics();
     if (this.applyingHostChange) {
+      this.scheduleCommandContextReport();
       return;
     }
     if (!this.configured) {
@@ -793,6 +811,7 @@ class EditorController {
     }
     this.settleCompositionAfterUpdate();
     this.scheduleDiagnostics();
+    this.scheduleCommandContextReport();
     this.tryFinishFlushes();
   }
 
@@ -823,6 +842,7 @@ class EditorController {
     this.pendingAcks.delete(revision);
     this.hostRevision = Math.max(this.hostRevision, revision);
     this.pumpTransactions();
+    this.scheduleCommandContextReport();
     this.tryFinishFlushes();
   }
 
@@ -834,6 +854,7 @@ class EditorController {
       this.tryFinishFlushes();
       return;
     }
+    this.retireFindHistory();
     this.replaceDocument(command.text, command.selections, true);
     this.hostText = command.text;
     this.hostRevision = Number(command.revision);
@@ -843,6 +864,7 @@ class EditorController {
     this.deferredLocalSync = false;
     this.divergent = false;
     this.scheduleDiagnostics();
+    this.scheduleCommandContextReport(true);
     this.tryFinishFlushes();
   }
 
@@ -908,23 +930,32 @@ class EditorController {
     return true;
   }
 
-  routeCommand(requestID, command) {
-    const scope = this.focusScopeForActiveElement();
+  routeCommand(command) {
+    const commandName = command?.command;
+    const requestID = command?.requestID;
+    const expectedRevision = Number(command?.expectedRevision);
+    const expectation = command?.expectation === "find"
+      ? { scope: "find", contextID: command.findContextID }
+      : command?.expectation === "contentOrCurrentFind"
+        ? { scope: "contentOrCurrentFind", contextID: null }
+        : null;
     let result = "unavailable";
-    if (scope === "content") {
-      result = "forwardedToHost";
-    } else if (scope === "embeddedControl") {
-      const input = this.documentRef?.querySelector?.(".cm-search input");
-      if (input && this.documentRef?.activeElement === input) {
-        try {
-          const supported = this.documentRef.queryCommandSupported?.(command) === true;
-          const enabled = supported && this.documentRef.queryCommandEnabled?.(command) === true;
-          const executed = enabled && this.documentRef.execCommand?.(command) === true;
-          if (this.documentRef.activeElement === input && supported && enabled && executed) {
-            result = "handledByEmbeddedControl";
-          }
-        } catch {
-          result = "unavailable";
+    if (requestID && (commandName === "undo" || commandName === "redo")
+      && Number.isInteger(expectedRevision) && expectedRevision === this.localRevision
+      && expectation) {
+      if (expectation.scope === "find") {
+        const input = this.exactFindInput();
+        if (input && expectation.contextID === this.ensureFindContext(input)) {
+          result = this.performFindHistory(commandName, input, expectation.contextID)
+            ? "handledByEmbeddedControl" : "unavailable";
+        }
+      } else {
+        const input = this.exactFindInput();
+        if (input) {
+          result = this.performFindHistory(commandName, input, this.ensureFindContext(input))
+            ? "handledByEmbeddedControl" : "unavailable";
+        } else if (this.isContentFocused()) {
+          result = "forwardedToHost";
         }
       }
     }
@@ -932,7 +963,9 @@ class EditorController {
       type: "commandRouteResult",
       requestID,
       revision: this.localRevision,
-      command,
+      command: commandName,
+      expectation: expectation?.scope,
+      findContextID: expectation?.contextID ?? null,
       result
     });
   }
@@ -999,6 +1032,7 @@ class EditorController {
       const id = crypto.randomUUID();
       this.composition = { phase: "began", id };
       this.compositionActive = true;
+      this.scheduleCommandContextReport(true);
     };
     const update = () => {
       if (this.compositionActive && this.composition.id) {
@@ -1012,6 +1046,7 @@ class EditorController {
       this.compositionEnding = true;
       this.compositionActive = false;
       this.scheduleCompositionSettlement();
+      this.scheduleCommandContextReport(true);
     };
     this.view.dom.addEventListener("compositionstart", start);
     this.view.dom.addEventListener("compositionupdate", update);
@@ -1030,6 +1065,7 @@ class EditorController {
       }
       this.compositionEnding = false;
       this.composition = { phase: "none", id: null };
+      this.scheduleCommandContextReport(true);
       this.tryFinishFlushes();
     }, 0);
   }
@@ -1050,8 +1086,20 @@ class EditorController {
     if (!this.documentRef?.addEventListener) {
       return;
     }
-    const focusIn = () => this.scheduleFocusReport();
-    const focusOut = () => this.scheduleFocusReport();
+    const focusIn = event => {
+      const input = this.exactFindInput();
+      if (input && event.target === input) {
+        this.ensureFindContext(input, !this.findFocusActive && this.findInput === input);
+        this.findFocusActive = true;
+      }
+      this.scheduleCommandContextReport(true);
+    };
+    const focusOut = event => {
+      if (event.target === this.findInput) {
+        this.retireFindHistory();
+      }
+      this.scheduleCommandContextReport(true);
+    };
     this.documentRef.addEventListener("focusin", focusIn, true);
     this.documentRef.addEventListener("focusout", focusOut, true);
     this.focusHandlers = [
@@ -1060,44 +1108,581 @@ class EditorController {
     ];
   }
 
-  scheduleFocusReport() {
-    if (this.focusReportTimer !== null) {
+  installCommandContextHandlers() {
+    if (!this.documentRef?.addEventListener) {
       return;
     }
-    this.focusReportTimer = Promise.resolve().then(() => {
-      this.focusReportTimer = null;
-      this.reportFocusScope(false);
+    const beforeInput = event => {
+      const input = this.findInputElement();
+      if (!input || event.target !== input || this.documentRef.activeElement !== input) {
+        return;
+      }
+      const contextID = this.ensureFindContext(input);
+      if (event.inputType === "historyUndo" || event.inputType === "historyRedo") {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+        this.performFindHistory(
+          event.inputType === "historyUndo" ? "undo" : "redo",
+          input,
+          contextID
+        );
+        return;
+      }
+      if (this.findHistory?.applying) {
+        return;
+      }
+      this.clearFindBeforeInput();
+      if (event.isTrusted !== true || event.defaultPrevented) {
+        return;
+      }
+      this.synchronizeFindHistory(input);
+      this.captureFindBeforeInput(event.inputType);
+      this.scheduleCommandContextReport(true);
+    };
+    const input = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput) {
+        return;
+      }
+      this.handleFindInput(findInput, event);
+    };
+    const selectionChange = () => {
+      const findInput = this.exactFindInput();
+      if (!findInput) {
+        return;
+      }
+      const history = this.findHistory;
+      if (!history || history.applying || history.compositionActive || history.compositionEnding) {
+        return;
+      }
+      this.synchronizeFindHistory(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    const keydown = event => {
+      const findInput = this.exactFindInput();
+      if (!findInput || event.target !== findInput || this.documentRef.activeElement !== findInput
+        || !event.metaKey || event.ctrlKey || event.altKey
+        || String(event.key).toLowerCase() !== "z") {
+        return;
+      }
+      const command = event.shiftKey ? "redo" : "undo";
+      const contextID = this.ensureFindContext(findInput);
+      event.preventDefault?.();
+      event.stopImmediatePropagation?.();
+      this.performFindHistory(command, findInput, contextID);
+    };
+    const compositionStart = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || this.documentRef.activeElement !== findInput) {
+        return;
+      }
+      this.ensureFindContext(findInput);
+      this.synchronizeFindHistory(findInput);
+      const history = this.findHistory;
+      if (!history || history.applying) {
+        return;
+      }
+      this.cancelFindCompositionSettlement();
+      history.compositionGeneration += 1;
+      history.compositionStart = history.current;
+      history.compositionActive = true;
+      history.compositionEnding = false;
+      history.compositionCancelled = false;
+      history.compositionAbandoned = history.oversized;
+      this.clearFindBeforeInput();
+      this.scheduleCommandContextReport(true);
+    };
+    const compositionEnd = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || !this.findHistory?.compositionActive) {
+        return;
+      }
+      this.findHistory.compositionActive = false;
+      this.findHistory.compositionEnding = true;
+      this.scheduleFindCompositionSettlement(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    const compositionCancel = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || !this.findHistory?.compositionActive) {
+        return;
+      }
+      this.findHistory.compositionActive = false;
+      this.findHistory.compositionEnding = true;
+      this.findHistory.compositionCancelled = true;
+      this.clearFindBeforeInput();
+      this.scheduleFindCompositionSettlement(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    this.documentRef.addEventListener("input", input, true);
+    this.documentRef.addEventListener("beforeinput", beforeInput, true);
+    this.documentRef.addEventListener("selectionchange", selectionChange, true);
+    this.documentRef.addEventListener("keydown", keydown, true);
+    this.documentRef.addEventListener("compositionstart", compositionStart, true);
+    this.documentRef.addEventListener("compositionend", compositionEnd, true);
+    this.documentRef.addEventListener("compositioncancel", compositionCancel, true);
+    this.commandContextHandlers = [
+      ["input", input],
+      ["beforeinput", beforeInput],
+      ["selectionchange", selectionChange],
+      ["keydown", keydown],
+      ["compositionstart", compositionStart],
+      ["compositionend", compositionEnd],
+      ["compositioncancel", compositionCancel]
+    ];
+    if (this.documentRef.defaultView?.MutationObserver && this.documentRef.body) {
+      this.contextObserver = new this.documentRef.defaultView.MutationObserver(() => {
+        const input = this.findInputElement();
+        if (input !== this.findInput) {
+          if (input) {
+            this.ensureFindContext(input);
+          } else {
+            this.retireFindHistory();
+          }
+        }
+        this.scheduleCommandContextReport(true);
+      });
+      this.contextObserver.observe(this.documentRef.body, { childList: true, subtree: true });
+    }
+  }
+
+  findInputElement() {
+    return this.documentRef?.querySelector?.(".cm-search input") ?? null;
+  }
+
+  exactFindInput() {
+    const input = this.findInputElement();
+    return input && this.documentRef?.activeElement === input ? input : null;
+  }
+
+  resetFindHistoryForPanelReopen() {
+    const input = this.findInputElement();
+    if (!input) {
+      this.retireFindHistory();
+      return;
+    }
+    this.resetFindHistory(input, this.findSnapshot(input));
+    this.findFocusActive = this.documentRef.activeElement === input;
+  }
+
+  ensureFindContext(input, resetExisting = false) {
+    if (this.findInput !== input || !this.findContextID || resetExisting || !this.findHistory) {
+      this.resetFindHistory(input, this.findSnapshot(input));
+    }
+    return this.findContextID;
+  }
+
+  makeFindHistory(snapshot) {
+    const oversized = snapshot.value.length > MAX_FIND_HISTORY_UNITS;
+    return {
+      current: oversized ? null : snapshot,
+      undo: [],
+      redo: [],
+      pendingBeforeInput: null,
+      pendingGeneration: 0,
+      compositionStart: null,
+      compositionGeneration: 0,
+      compositionActive: false,
+      compositionEnding: false,
+      compositionCancelled: false,
+      compositionAbandoned: false,
+      applying: false,
+      oversized
+    };
+  }
+
+  resetFindHistory(input, snapshot) {
+    this.clearFindBeforeInput();
+    this.cancelFindCompositionSettlement();
+    this.findInput = input;
+    this.findContextID = crypto.randomUUID();
+    this.findHistory = this.makeFindHistory(snapshot);
+  }
+
+  retireFindHistory() {
+    this.clearFindBeforeInput();
+    this.cancelFindCompositionSettlement();
+    this.findContextID = null;
+    this.findFocusActive = false;
+    this.findInput = null;
+    this.findHistory = null;
+  }
+
+  cancelFindCompositionSettlement() {
+    if (this.findCompositionSettlementTimer !== null) {
+      clearTimeout(this.findCompositionSettlementTimer);
+      this.findCompositionSettlementTimer = null;
+    }
+  }
+
+  findSnapshot(input) {
+    const value = String(input?.value ?? "");
+    const selectionStart = Number.isInteger(input?.selectionStart)
+      ? Math.max(0, Math.min(value.length, input.selectionStart))
+      : value.length;
+    const selectionEnd = Number.isInteger(input?.selectionEnd)
+      ? Math.max(selectionStart, Math.min(value.length, input.selectionEnd))
+      : selectionStart;
+    return {
+      value,
+      selectionStart,
+      selectionEnd,
+      selectionDirection: input?.selectionDirection === "backward" ? "backward" : "forward"
+    };
+  }
+
+  sameFindSnapshot(first, second) {
+    return Boolean(first && second) && first.value === second.value
+      && first.selectionStart === second.selectionStart
+      && first.selectionEnd === second.selectionEnd
+      && first.selectionDirection === second.selectionDirection;
+  }
+
+  findHistoryUnits(history, current = history.current) {
+    const snapshots = new Set([
+      current, ...history.undo, ...history.redo,
+      history.pendingBeforeInput?.before, history.compositionStart
+    ]);
+    let units = 0;
+    for (const snapshot of snapshots) {
+      units += snapshot?.value.length ?? 0;
+    }
+    return units;
+  }
+
+  trimFindHistory(history, current = history.current) {
+    const bounded = current && current.value.length <= MAX_FIND_HISTORY_UNITS ? current : null;
+    if (!bounded) {
+      this.abandonFindComposition(history);
+    }
+    while (history.undo.length + history.redo.length > MAX_FIND_HISTORY_SNAPSHOTS
+      || this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      if (history.undo.length > 0) {
+        history.undo.shift();
+      } else if (history.redo.length > 0) {
+        history.redo.shift();
+      } else {
+        break;
+      }
+    }
+    if (this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      this.clearFindBeforeInput();
+    }
+    if (this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      this.abandonFindComposition(history);
+    }
+    history.current = bounded;
+    history.oversized = !bounded;
+  }
+
+  abandonFindComposition(history) {
+    history.undo = [];
+    history.redo = [];
+    this.clearFindBeforeInput();
+    history.compositionStart = null;
+    history.compositionAbandoned = true;
+  }
+
+  synchronizeFindHistory(input) {
+    const history = this.findHistory;
+    const live = this.findSnapshot(input);
+    if (this.sameFindSnapshot(history.current, live)) {
+      return;
+    }
+    if (live.value !== history.current?.value) {
+      if (!history.compositionActive && !history.compositionEnding) {
+        this.resetFindHistory(input, live);
+        return;
+      }
+      this.abandonFindComposition(history);
+    }
+    this.trimFindHistory(history, live);
+  }
+
+  captureFindBeforeInput(inputType) {
+    this.clearFindBeforeInput();
+    const history = this.findHistory;
+    if (!history.current) {
+      return;
+    }
+    const contextID = this.findContextID;
+    const generation = ++history.pendingGeneration;
+    history.pendingBeforeInput = {
+      contextID,
+      generation,
+      inputType: String(inputType || ""),
+      before: history.current
+    };
+    this.expireFindBeforeInput(contextID, generation);
+  }
+
+  expireFindBeforeInput(contextID, generation) {
+    const timer = setTimeout(() => {
+      if (this.findBeforeInputExpiryTimer !== timer) {
+        return;
+      }
+      this.findBeforeInputExpiryTimer = null;
+      const history = this.findHistory;
+      const pending = history?.pendingBeforeInput;
+      if (this.findContextID === contextID
+        && pending?.contextID === contextID
+        && pending?.generation === generation
+        && history.pendingGeneration === generation) {
+        history.pendingBeforeInput = null;
+      }
+    }, 0);
+    this.findBeforeInputExpiryTimer = timer;
+  }
+
+  clearFindBeforeInput() {
+    if (this.findBeforeInputExpiryTimer !== null) {
+      clearTimeout(this.findBeforeInputExpiryTimer);
+      this.findBeforeInputExpiryTimer = null;
+    }
+    if (this.findHistory) {
+      this.findHistory.pendingBeforeInput = null;
+    }
+  }
+
+  recordFindInputTransition(input, before, after) {
+    const history = this.findHistory;
+    if (!history || history.applying) {
+      return;
+    }
+    if (after.value.length > MAX_FIND_HISTORY_UNITS || before.value.length > MAX_FIND_HISTORY_UNITS) {
+      this.resetFindHistory(input, after);
+      this.findHistory.oversized = true;
+      return;
+    }
+    history.undo.push(before);
+    history.redo = [];
+    this.trimFindHistory(history, after);
+  }
+
+  handleFindInput(input, event) {
+    if (this.findInput !== input || !this.findContextID) {
+      this.ensureFindContext(input);
+    }
+    const history = this.findHistory;
+    if (!history) {
+      return;
+    }
+    const after = this.findSnapshot(input);
+    if (history.applying) {
+      this.scheduleCommandContextReport(true);
+      return;
+    }
+    const pending = history.pendingBeforeInput;
+    this.clearFindBeforeInput();
+    const paired = event?.isTrusted === true
+      && pending?.contextID === this.findContextID
+      && pending?.generation === history.pendingGeneration
+      && pending?.inputType === String(event.inputType || "")
+      && this.sameFindSnapshot(pending?.before, history.current);
+    if (history.compositionActive || history.compositionEnding) {
+      if (!paired) {
+        this.abandonFindComposition(history);
+      }
+      this.trimFindHistory(history, after);
+    } else if (!paired) {
+      this.resetFindHistory(input, after);
+    } else if (!this.sameFindSnapshot(pending.before, after)) {
+      this.recordFindInputTransition(input, pending.before, after);
+    } else {
+      this.trimFindHistory(history, after);
+    }
+    this.scheduleCommandContextReport(true);
+  }
+
+  scheduleFindCompositionSettlement(input) {
+    this.cancelFindCompositionSettlement();
+    const contextID = this.findContextID;
+    const generation = this.findHistory.compositionGeneration;
+    const timer = setTimeout(() => {
+      if (this.findCompositionSettlementTimer !== timer) {
+        return;
+      }
+      this.findCompositionSettlementTimer = null;
+      const history = this.findHistory;
+      if (!history || this.findInput !== input || this.findContextID !== contextID
+        || history.compositionGeneration !== generation || !history.compositionEnding) {
+        return;
+      }
+      const after = this.findSnapshot(input);
+      const before = history.compositionStart;
+      const cancelled = history.compositionCancelled;
+      history.compositionStart = null;
+      history.compositionEnding = false;
+      history.compositionCancelled = false;
+      this.clearFindBeforeInput();
+      if (history.compositionAbandoned) {
+        this.resetFindHistory(input, after);
+      } else if (cancelled && before) {
+        this.applyFindSnapshot(input, before, contextID);
+      } else if (before && !this.sameFindSnapshot(before, after)) {
+        this.recordFindInputTransition(input, before, after);
+      } else {
+        this.trimFindHistory(history, after);
+      }
+      this.scheduleCommandContextReport(true);
+    }, 0);
+    this.findCompositionSettlementTimer = timer;
+  }
+
+  isContentFocused() {
+    const activeElement = this.documentRef?.activeElement;
+    const content = this.view?.contentDOM ?? this.view?.dom?.querySelector?.(".cm-content");
+    return Boolean(activeElement && content && activeElement === content);
+  }
+
+  findCommandAvailability(command) {
+    const input = this.exactFindInput();
+    const history = this.findHistory;
+    if (!input || !history || history.oversized || history.compositionActive || history.compositionEnding) {
+      return { isSupported: false, isEnabled: false };
+    }
+    return {
+      isSupported: true,
+      isEnabled: command === "undo" ? history.undo.length > 0 : history.redo.length > 0
+    };
+  }
+
+  currentCommandContext() {
+    const input = this.exactFindInput();
+    if (input) {
+      const contextID = this.ensureFindContext(input);
+      const undo = this.findCommandAvailability("undo");
+      const redo = this.findCommandAvailability("redo");
+      return {
+        scope: "find",
+        findContextID: contextID,
+        undoSupported: undo.isSupported,
+        undoEnabled: undo.isEnabled,
+        redoSupported: redo.isSupported,
+        redoEnabled: redo.isEnabled
+      };
+    }
+    if (this.isContentFocused()) {
+      return {
+        scope: "content",
+        findContextID: null,
+        undoSupported: false,
+        undoEnabled: false,
+        redoSupported: false,
+        redoEnabled: false
+      };
+    }
+    return {
+      scope: "unavailable",
+      findContextID: null,
+      undoSupported: false,
+      undoEnabled: false,
+      redoSupported: false,
+      redoEnabled: false
+    };
+  }
+
+  scheduleCommandContextReport(force = false) {
+    this.commandContextForcePending ||= force;
+    if (this.commandContextTimer !== null) {
+      return;
+    }
+    this.commandContextTimer = Promise.resolve().then(() => {
+      this.commandContextTimer = null;
+      const shouldForce = this.commandContextForcePending;
+      this.commandContextForcePending = false;
+      this.reportCommandContext(shouldForce);
     });
   }
 
-  focusScopeForActiveElement() {
-    const activeElement = this.documentRef?.activeElement;
-    const content = this.view?.contentDOM ?? this.view?.dom?.querySelector?.(".cm-content");
-    if (activeElement && content && activeElement === content) {
-      return "content";
-    }
-    const findInput = this.documentRef?.querySelector?.(".cm-search input");
-    if (activeElement && findInput && activeElement === findInput) {
-      return "embeddedControl";
-    }
-    return "other";
-  }
-
-  reportFocusScope(force) {
+  reportCommandContext(force = false) {
     if (!this.configured || !this.sessionID || !this.replicaID || !this.loadID) {
       return;
     }
-    const scope = this.focusScopeForActiveElement();
-    if (!force && scope === this.reportedFocusScope) {
+    const context = this.currentCommandContext();
+    const revision = this.localRevision;
+    const signature = JSON.stringify(context);
+    if (!force && signature === this.reportedCommandContext
+      && revision === this.reportedCommandContextRevision) {
       return;
     }
-    this.reportedFocusScope = scope;
-    this.focusSequence += 1;
+    this.reportedCommandContext = signature;
+    this.reportedCommandContextRevision = revision;
+    this.commandContextSequence += 1;
     this.post({
-      type: "focusScope",
-      focusSequence: this.focusSequence,
-      focusScope: scope
+      type: "commandContext",
+      revision,
+      contextSequence: this.commandContextSequence,
+      commandScope: context.scope,
+      findContextID: context.findContextID,
+      undoSupported: context.undoSupported,
+      undoEnabled: context.undoEnabled,
+      redoSupported: context.redoSupported,
+      redoEnabled: context.redoEnabled
     });
+  }
+
+  performFindHistory(command, input, contextID) {
+    if (!input || this.documentRef.activeElement !== input
+      || contextID !== this.ensureFindContext(input)
+      || !this.findHistory
+      || this.findHistory.oversized
+      || this.findHistory.compositionActive
+      || this.findHistory.compositionEnding) {
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const history = this.findHistory;
+    const source = command === "undo" ? history.undo : history.redo;
+    const destination = command === "undo" ? history.redo : history.undo;
+    if (source.length === 0) {
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const current = this.findSnapshot(input);
+    if (!this.sameFindSnapshot(current, history.current)) {
+      this.resetFindHistory(input, current);
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const target = source.pop();
+    destination.push(history.current);
+    return this.applyFindSnapshot(input, target, contextID);
+  }
+
+  applyFindSnapshot(input, target, contextID) {
+    const history = this.findHistory;
+    if (!history || this.exactFindInput() !== input || contextID !== this.findContextID) {
+      return false;
+    }
+    this.clearFindBeforeInput();
+    history.applying = true;
+    let applied = false;
+    try {
+      input.value = target.value;
+      input.setSelectionRange(target.selectionStart, target.selectionEnd, target.selectionDirection);
+      applied = true;
+    } catch {
+      applied = false;
+    }
+    try {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      applied = applied && this.exactFindInput() === input && this.findContextID === contextID
+        && this.sameFindSnapshot(this.findSnapshot(input), target);
+    } catch {
+      applied = false;
+    } finally {
+      history.applying = false;
+    }
+    if (this.findContextID === contextID) {
+      if (applied) {
+        this.trimFindHistory(history, target);
+      } else {
+        this.resetFindHistory(input, this.findSnapshot(input));
+      }
+    }
+    this.scheduleCommandContextReport(true);
+    return applied;
   }
 
   destroy() {
@@ -1107,8 +1692,17 @@ class EditorController {
       }
     }
     this.focusHandlers = [];
-    this.focusReportTimer = null;
-    this.reportedFocusScope = null;
+    this.commandContextTimer = null;
+    this.commandContextForcePending = false;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.retireFindHistory();
+    for (const [name, handler] of this.commandContextHandlers) {
+      this.documentRef?.removeEventListener(name, handler, true);
+    }
+    this.commandContextHandlers = [];
+    this.contextObserver?.disconnect?.();
+    this.contextObserver = null;
     this.configured = false;
     this.initializing = true;
     this.sessionID = null;

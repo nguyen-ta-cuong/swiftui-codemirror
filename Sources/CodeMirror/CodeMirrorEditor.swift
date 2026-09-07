@@ -27,6 +27,11 @@ internal func resolvedCodeMirrorAppearance(
 
 #if canImport(AppKit)
   @MainActor
+  internal final class CodeMirrorWebView: WKWebView {
+    override var undoManager: UndoManager? { nil }
+  }
+
+  @MainActor
   public struct CodeMirrorEditor: NSViewRepresentable {
     public typealias NSViewType = WKWebView
 
@@ -50,7 +55,7 @@ internal func resolvedCodeMirrorAppearance(
     public func makeNSView(context: Context) -> WKWebView {
       let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
       let configuration = makeWebViewConfiguration(coordinator: coordinator)
-      let webView = WKWebView(frame: .zero, configuration: configuration)
+      let webView = CodeMirrorWebView(frame: .zero, configuration: configuration)
       webView.setValue(false, forKey: "drawsBackground")
       coordinator.attach(webView: webView)
       coordinator.update(appearance: resolvedAppearance)
