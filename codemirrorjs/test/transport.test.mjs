@@ -941,6 +941,40 @@ test("compositionend without a changed document settles on the next event-loop t
   controller.destroy();
 });
 
+test("flush requests reject beyond the bounded live-operation budget", () => {
+  const harness = makeController("source");
+  const { controller, messages } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.compositionActive = true;
+
+  for (let index = 0; index < 32; index += 1) {
+    controller.flush(`flush-${index}`);
+  }
+  assert.equal(controller.flushRequests.size, 32);
+
+  controller.flush("flush-overflow");
+  assert.equal(controller.flushRequests.has("flush-overflow"), false);
+  assert.deepEqual(messages.at(-1), {
+    type: "flushResult",
+    requestID: "flush-overflow",
+    success: false,
+    code: "timeout",
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+
+  controller.compositionActive = false;
+  controller.tryFinishFlushes();
+  assert.equal(controller.flushRequests.size, 0);
+  assert.equal(
+    messages.filter(message => message.type === "flushResult" && message.success === true).length,
+    32
+  );
+  controller.destroy();
+});
+
 test("initial configuration replaces only the disabled loading document and never emits a full local overwrite", () => {
   const harness = makeController("");
   const { controller, messages } = harness;
