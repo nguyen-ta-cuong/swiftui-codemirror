@@ -4,31 +4,35 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodeMirror",
-    platforms: [
-        .iOS(.v17),
-        .macOS(.v14),
-    ],
-    products: [
-        .library(
-            name: "CodeMirror",
-            targets: ["CodeMirror"]
-        )
-    ],
-    dependencies: [],
-    targets: [
-        .target(
-            name: "CodeMirror",
-            // exclude: [
-            //     "html/codemirror.js",
-            //     "html/node_modules",
-            //     "html/package-lock.json",
-            //     "html/package.json",
-            //     "html/rollup.config.mjs",
-            // ],
-            resources: [
-                .copy("web.bundle")
-            ]
-        )
-    ]
+  name: "CodeMirror",
+  platforms: [
+    .iOS(.v17),
+    .macOS(.v14),
+  ],
+  products: [
+    .library(
+      name: "CodeMirror",
+      targets: ["CodeMirror"]
+    )
+  ],
+  dependencies: [],
+  targets: [
+    .target(
+      name: "CodeMirror",
+      // exclude: [
+      //     "html/codemirror.js",
+      //     "html/node_modules",
+      //     "html/package-lock.json",
+      //     "html/package.json",
+      //     "html/rollup.config.mjs",
+      // ],
+      resources: [
+        .copy("web.bundle")
+      ]
+    ),
+    .testTarget(
+      name: "CodeMirrorTests",
+      dependencies: ["CodeMirror"]
+    ),
+  ]
 )

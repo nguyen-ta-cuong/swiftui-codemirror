@@ -1,318 +1,1744 @@
-import * as CodeMirror from "codemirror";
-import { Compartment, EditorState } from "@codemirror/state";
-import { EditorView, placeholder } from "@codemirror/view";
-import { indentWithTab } from "@codemirror/commands";
-import { langs } from '@uiw/codemirror-extensions-langs';
-
+import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion } from "@codemirror/autocomplete";
+import { indentUnit, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
+import { json } from "@codemirror/lang-json";
+import { xml } from "@codemirror/lang-xml";
+import { graphql } from "cm6-graphql";
+import { lintGutter, lintKeymap, setDiagnostics } from "@codemirror/lint";
+import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
+import { EditorView, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter, highlightSpecialChars, keymap, lineNumbers } from "@codemirror/view";
+import { openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { oneDark } from "@codemirror/theme-one-dark";
 
-import { abcdef } from '@uiw/codemirror-theme-abcdef';
-import { abyss } from '@uiw/codemirror-theme-abyss';
-import { androidstudio } from '@uiw/codemirror-theme-androidstudio';
-import { andromeda } from '@uiw/codemirror-theme-andromeda';
-import { atomone } from '@uiw/codemirror-theme-atomone';
-import { aura } from '@uiw/codemirror-theme-aura';
-import { basicLight, basicDark } from '@uiw/codemirror-theme-basic';
-import { bbedit } from '@uiw/codemirror-theme-bbedit';
-import { dracula } from '@uiw/codemirror-theme-dracula';
-import { darcula } from '@uiw/codemirror-theme-darcula';
-import { eclipse } from '@uiw/codemirror-theme-eclipse';
-import { bespin } from '@uiw/codemirror-theme-bespin';
-import { copilot } from '@uiw/codemirror-theme-copilot';
-import { consoleDark, consoleLight } from '@uiw/codemirror-theme-console';
-import { materialLight, materialDark } from '@uiw/codemirror-theme-material';
-import { monokai } from '@uiw/codemirror-theme-monokai';
-import { monokaiDimmed } from '@uiw/codemirror-theme-monokai-dimmed';
-import { noctisLilac } from '@uiw/codemirror-theme-noctis-lilac';
-import { vscodeDark, vscodeLight } from '@uiw/codemirror-theme-vscode';
-import { duotoneLight, duotoneDark } from '@uiw/codemirror-theme-duotone';
-import { githubLight, githubDark } from '@uiw/codemirror-theme-github';
-import { gruvboxDark, gruvboxLight } from '@uiw/codemirror-theme-gruvbox-dark';
-import { kimbie } from '@uiw/codemirror-theme-kimbie';
-import { nord } from '@uiw/codemirror-theme-nord';
-import { okaidia } from '@uiw/codemirror-theme-okaidia';
-import { red } from '@uiw/codemirror-theme-red';
-import { quietlight } from '@uiw/codemirror-theme-quietlight';
-import { solarizedLight, solarizedDark } from '@uiw/codemirror-theme-solarized';
-import { sublime } from '@uiw/codemirror-theme-sublime';
-import { tokyoNight } from '@uiw/codemirror-theme-tokyo-night';
-import { tokyoNightStorm } from '@uiw/codemirror-theme-tokyo-night-storm';
-import { tokyoNightDay } from '@uiw/codemirror-theme-tokyo-night-day';
-import { tomorrowNightBlue } from '@uiw/codemirror-theme-tomorrow-night-blue';
-import { xcodeLight, xcodeDark } from '@uiw/codemirror-theme-xcode';
-import { whiteLight, whiteDark } from '@uiw/codemirror-theme-white';
+export const MAX_ANALYSIS_BYTES = 1024 * 1024;
+const MAX_FIND_HISTORY_SNAPSHOTS = 32;
+const MAX_FIND_HISTORY_UNITS = 1024 * 1024;
 
-import {
-  lineNumbers,
-  highlightActiveLineGutter,
-  highlightSpecialChars,
-  drawSelection,
-  dropCursor,
-  rectangularSelection,
-  crosshairCursor,
-  highlightActiveLine,
-  keymap,
-} from "@codemirror/view";
+export function utf8ByteLength(value) {
+  return new TextEncoder().encode(value).byteLength;
+}
 
-import {
-  foldGutter,
-  indentOnInput,
-  syntaxHighlighting,
-  defaultHighlightStyle,
-  bracketMatching,
-  foldKeymap,
-} from "@codemirror/language";
+export function isAnalysisAvailable(value) {
+  return utf8ByteLength(value) <= MAX_ANALYSIS_BYTES;
+}
 
-import { history, defaultKeymap, historyKeymap } from "@codemirror/commands";
-import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
-import {
-  closeBrackets,
-  autocompletion,
-  closeBracketsKeymap,
-  completionKeymap,
-} from "@codemirror/autocomplete";
+function makeDiagnostic(value, from, to, message, source, severity = "error") {
+  const start = Math.max(0, Math.min(from, value.length));
+  const end = Math.max(start, Math.min(to, value.length));
+  return { from: start, to: end, severity, message, source };
+}
 
-const SUPPORTED_LANGUAGES_MAP = langs;
+function unavailableDiagnostic(value) {
+  return makeDiagnostic(
+    value,
+    0,
+    Math.min(1, value.length),
+    "Syntax analysis and formatting are unavailable above 1 MiB; the source remains fully editable.",
+    "CodeMirror",
+    "info"
+  );
+}
 
-const THEMES_MAP = {
-  abcdef,
-  abyss,
-  androidstudio,
-  andromeda,
-  atomone,
-  aura,
-  basicLight,
-  basicDark,
-  bbedit,
-  bespin,
-  consoleDark,
-  consoleLight,
-  copilot,
-  darcula,
-  dracula,
-  duotoneLight,
-  duotoneDark,
-  eclipse,
-  githubLight,
-  githubDark,
-  gruvboxDark,
-  gruvboxLight,
-  kimbie,
-  materialLight,
-  materialDark,
-  monokai,
-  monokaiDimmed,
-  noctisLilac,
-  nord,
-  okaidia,
-  red,
-  quietlight,
-  solarizedLight,
-  solarizedDark,
-  sublime,
-  tokyoNight,
-  tokyoNightStorm,
-  tokyoNightDay,
-  tomorrowNightBlue,
-  vscodeDark,
-  vscodeLight,
-  whiteLight,
-  whiteDark,
-  xcodeLight,
-  xcodeDark,
-};
+function jsonDiagnostics(value) {
+  try {
+    JSON.parse(value);
+    return [];
+  } catch (error) {
+    const position = Number(error?.message?.match(/position (\d+)/i)?.[1]);
+    const from = Number.isInteger(position) ? position : Math.max(0, value.length - 1);
+    return [makeDiagnostic(value, from, from + 1, error?.message || "JSON syntax is invalid.", "JSON")];
+  }
+}
 
-const baseTheme = EditorView.baseTheme({
-  "&light": {
-    backgroundColor: "white", // the default codemirror light theme doesn't set this up
-    "color-scheme": "light",
-  },
-  "&dark": {
-    "color-scheme": "dark",
-  },
-});
-
-const fontSizeTheme = (size = 14) => {
-  const baseStyle = {
-    '&': {
-      fontSize: size + "px",
+function xmlDiagnostics(value) {
+  const diagnostics = [];
+  const stack = [];
+  const report = (from, to, message) => {
+    if (diagnostics.length < 8) {
+      diagnostics.push(makeDiagnostic(value, from, to, message, "XML"));
     }
   };
-  return EditorView.theme(baseStyle);
-};
-
-const theme = new Compartment();
-const language = new Compartment();
-const listener = new Compartment();
-const readOnly = new Compartment();
-const lineWrapping = new Compartment();
-const lineNumber = new Compartment();
-const foldGutterComp = new Compartment();
-const searchKeymapComp = new Compartment();
-const placeholderComp = new Compartment();
-const highlightActiveLineComp = new Compartment();
-const fontSizeComp = new Compartment();
-
-const editorView = new CodeMirror.EditorView({
-  doc: "",
-  extensions: [
-    highlightActiveLineGutter(),
-    highlightSpecialChars(),
-    history(),
-    drawSelection(),
-    dropCursor(),
-    indentOnInput(),
-    syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    bracketMatching(),
-    closeBrackets(),
-    autocompletion(),
-    rectangularSelection(),
-    crosshairCursor(),
-    highlightSelectionMatches(),
-    keymap.of([
-      ...closeBracketsKeymap,
-      ...defaultKeymap,
-      ...historyKeymap,
-      ...foldKeymap,
-      ...completionKeymap,
-      indentWithTab,
-    ]),
-    highlightActiveLineComp.of([]),
-    placeholderComp.of([]),
-    searchKeymapComp.of([]),
-    foldGutterComp.of([]),
-    readOnly.of([]),
-    lineWrapping.of([]),
-    lineNumber.of([]),
-    baseTheme,
-    fontSizeComp.of(fontSizeTheme(14)),
-    theme.of(oneDark),
-    language.of([]),
-    listener.of([]),
-  ],
-  parent: document.body,
-});
-
-function getSupportedLanguages() {
-  return Object.keys(SUPPORTED_LANGUAGES_MAP);
-}
-
-Object.keys(THEMES_MAP).forEach((key) => {
-  THEMES_MAP[key.toLocaleLowerCase()] = THEMES_MAP[key]
-});
-
-function setTheme(name = "") {
-  let themeFn = THEMES_MAP[name.toLocaleLowerCase()];
-  editorView.dispatch({
-    effects: theme.reconfigure(themeFn ? [themeFn] : []),
-  });
-}
-
-function setLanguage(lang) {
-  let langFn = SUPPORTED_LANGUAGES_MAP[lang];
-  editorView.dispatch({
-    effects: language.reconfigure(langFn ? langFn() : []),
-  });
-}
-
-function setContent(text) {
-  let currentValue = editorView.state.doc.toString();
-  if (text === currentValue) {
-    return;
-  }
-  editorView.dispatch({
-    changes: { from: 0, to: editorView.state.doc.length, insert: text },
-  });
-}
-
-function getContent() {
-  return editorView.state.doc.toString();
-}
-
-function setListener(fn) {
-  editorView.dispatch({
-    effects: listener.reconfigure(
-      EditorView.updateListener.of((v) => {
-        if (v.docChanged) {
-          fn();
+  let index = 0;
+  while (index < value.length) {
+    const open = value.indexOf("<", index);
+    if (open < 0) {
+      break;
+    }
+    if (value.startsWith("<!--", open)) {
+      const close = value.indexOf("-->", open + 4);
+      if (close < 0) {
+        report(open, value.length, "XML comment is not closed.");
+        break;
+      }
+      index = close + 3;
+      continue;
+    }
+    if (value.startsWith("<![CDATA[", open)) {
+      const close = value.indexOf("]]>", open + 9);
+      if (close < 0) {
+        report(open, value.length, "XML CDATA section is not closed.");
+        break;
+      }
+      index = close + 3;
+      continue;
+    }
+    if (value.startsWith("<?", open)) {
+      const close = value.indexOf("?>", open + 2);
+      if (close < 0) {
+        report(open, value.length, "XML processing instruction is not closed.");
+        break;
+      }
+      index = close + 2;
+      continue;
+    }
+    let quote = null;
+    let close = open + 1;
+    for (; close < value.length; close += 1) {
+      const character = value[close];
+      if (quote) {
+        if (character === quote) {
+          quote = null;
         }
-      })
-    ),
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === ">") {
+        break;
+      }
+    }
+    if (close >= value.length) {
+      report(open, value.length, "XML tag is not closed.");
+      break;
+    }
+    const body = value.slice(open + 1, close);
+    if (body.startsWith("!")) {
+      index = close + 1;
+      continue;
+    }
+    const closing = /^\s*\/\s*([A-Za-z_][\w:.-]*)\s*$/.exec(body);
+    if (closing) {
+      const expected = stack.pop();
+      if (!expected) {
+        report(open, close + 1, `Unexpected closing tag </${closing[1]}>.`);
+      } else if (expected.name !== closing[1]) {
+        report(open, close + 1, `Closing tag </${closing[1]}> does not match <${expected.name}>.`);
+      }
+      index = close + 1;
+      continue;
+    }
+    const opening = /^\s*([A-Za-z_][\w:.-]*)\b/.exec(body);
+    if (!opening) {
+      report(open, close + 1, "XML tag name is missing or invalid.");
+      index = close + 1;
+      continue;
+    }
+    if (!/\/\s*$/.test(body)) {
+      stack.push({ name: opening[1], from: open });
+    }
+    index = close + 1;
+  }
+  while (stack.length > 0 && diagnostics.length < 8) {
+    const unclosed = stack.pop();
+    report(unclosed.from, Math.min(value.length, unclosed.from + unclosed.name.length + 2), `Opening tag <${unclosed.name}> is not closed.`);
+  }
+  return diagnostics;
+}
+
+function graphqlDiagnostics(value) {
+  const diagnostics = [];
+  const stack = [];
+  const report = (from, to, message) => {
+    if (diagnostics.length < 8) {
+      diagnostics.push(makeDiagnostic(value, from, to, message, "GraphQL"));
+    }
+  };
+  const matching = { "}": "{", "]": "[", ")": "(" };
+  let index = 0;
+  while (index < value.length) {
+    const character = value[index];
+    if (character === "#") {
+      const lineEnd = value.indexOf("\n", index);
+      index = lineEnd < 0 ? value.length : lineEnd + 1;
+      continue;
+    }
+    if (character === '"') {
+      if (value.startsWith('"""', index)) {
+        const close = value.indexOf('"""', index + 3);
+        if (close < 0) {
+          report(index, value.length, "GraphQL block string is not closed.");
+          break;
+        }
+        index = close + 3;
+        continue;
+      }
+      const start = index;
+      index += 1;
+      let closed = false;
+      while (index < value.length) {
+        if (value[index] === "\\") {
+          index += 2;
+          continue;
+        }
+        if (value[index] === '"') {
+          closed = true;
+          index += 1;
+          break;
+        }
+        if (value[index] === "\n" || value[index] === "\r") {
+          report(start, index + 1, "GraphQL string cannot contain an unescaped line break.");
+          break;
+        }
+        index += 1;
+      }
+      if (!closed && index >= value.length) {
+        report(start, value.length, "GraphQL string is not closed.");
+      }
+      continue;
+    }
+    if (Object.hasOwn(matching, character)) {
+      const expected = matching[character];
+      const previous = stack.pop();
+      if (!previous || previous.character !== expected) {
+        report(index, index + 1, `Unexpected GraphQL closing delimiter ${character}.`);
+      }
+      index += 1;
+      continue;
+    }
+    if (character === "{" || character === "[" || character === "(") {
+      stack.push({ character, from: index });
+    }
+    index += 1;
+  }
+  while (stack.length > 0 && diagnostics.length < 8) {
+    const unclosed = stack.pop();
+    report(unclosed.from, Math.min(value.length, unclosed.from + 1), `GraphQL delimiter ${unclosed.character} is not closed.`);
+  }
+  return diagnostics;
+}
+
+export function documentDiagnostics(language, value) {
+  if (!isAnalysisAvailable(value)) {
+    return [unavailableDiagnostic(value)];
+  }
+  switch (language) {
+  case "json":
+    return jsonDiagnostics(value);
+  case "xml":
+    return xmlDiagnostics(value);
+  case "graphql":
+    return graphqlDiagnostics(value);
+  default:
+    return [];
+  }
+}
+
+export function jsonLiteralCompletion(context) {
+  const word = context.matchBefore(/[A-Za-z]*/);
+  if (!context.explicit && (!word || word.from === word.to)) {
+    return null;
+  }
+  return {
+    from: word?.from ?? context.pos,
+    options: [
+      { label: "true", type: "keyword", detail: "JSON boolean" },
+      { label: "false", type: "keyword", detail: "JSON boolean" },
+      { label: "null", type: "keyword", detail: "JSON null" }
+    ],
+    validFor: /^[A-Za-z]*$/
+  };
+}
+
+function isUTF16Boundary(value, offset) {
+  if (!Number.isInteger(offset) || offset < 0 || offset > value.length) {
+    return false;
+  }
+  if (offset === 0 || offset === value.length) {
+    return true;
+  }
+  const previous = value.charCodeAt(offset - 1);
+  const next = value.charCodeAt(offset);
+  return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
+}
+
+export function validateChanges(value, changes) {
+  let previousEnd = 0;
+  for (const change of changes) {
+    if (!Number.isInteger(change.fromUTF16) || !Number.isInteger(change.toUTF16)) {
+      return { valid: false, reason: "range" };
+    }
+    if (change.fromUTF16 < previousEnd || change.fromUTF16 > change.toUTF16) {
+      return { valid: false, reason: "order" };
+    }
+    if (!isUTF16Boundary(value, change.fromUTF16) || !isUTF16Boundary(value, change.toUTF16)) {
+      return { valid: false, reason: "surrogate" };
+    }
+    previousEnd = change.toUTF16;
+  }
+  return { valid: true, reason: null };
+}
+
+export function applyChanges(value, changes) {
+  const validation = validateChanges(value, changes);
+  if (!validation.valid) {
+    throw new Error(`Invalid change: ${validation.reason}`);
+  }
+  let result = value;
+  for (const change of [...changes].reverse()) {
+    result = result.slice(0, change.fromUTF16) + change.insertedText + result.slice(change.toUTF16);
+  }
+  return result;
+}
+
+function tokenizeJSON(value) {
+  const tokens = [];
+  let index = 0;
+  while (index < value.length) {
+    const character = value[index];
+    if (/\s/.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      const start = index;
+      index += 1;
+      let escaped = false;
+      let closed = false;
+      while (index < value.length) {
+        const current = value[index];
+        if (escaped) {
+          escaped = false;
+        } else if (current === "\\") {
+          escaped = true;
+        } else if (current === '"') {
+          index += 1;
+          closed = true;
+          break;
+        }
+        index += 1;
+      }
+      if (!closed) {
+        return null;
+      }
+      tokens.push({ kind: "value", value: value.slice(start, index) });
+      continue;
+    }
+    if ("{}[],:".includes(character)) {
+      tokens.push({ kind: character, value: character });
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < value.length && !/[\s{}[\],:]/.test(value[index])) {
+      index += 1;
+    }
+    tokens.push({ kind: "value", value: value.slice(start, index) });
+  }
+  return tokens;
+}
+
+export function formatJSON(value) {
+  try {
+    JSON.parse(value);
+  } catch {
+    return { available: false, text: value, diagnostic: "JSON syntax is incomplete or invalid." };
+  }
+  const tokens = tokenizeJSON(value);
+  if (!tokens) {
+    return { available: false, text: value, diagnostic: "JSON string syntax is incomplete." };
+  }
+  const lines = [];
+  let current = "";
+  let indentation = 0;
+  const indentationText = () => "  ".repeat(indentation);
+  const flush = () => {
+    if (current.length > 0) {
+      lines.push(indentationText() + current);
+      current = "";
+    }
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const next = tokens[index + 1]?.kind;
+    if (token.kind === "{" || token.kind === "[") {
+      current += token.value;
+      if (next !== "}" && next !== "]") {
+        flush();
+        indentation += 1;
+      }
+      continue;
+    }
+    if (token.kind === "}" || token.kind === "]") {
+      if (current === "{" || current === "[") {
+        current += token.value;
+        continue;
+      }
+      flush();
+      indentation = Math.max(0, indentation - 1);
+      current = token.value;
+      if (next !== "," && next !== "}" && next !== "]") {
+        flush();
+      }
+      continue;
+    }
+    if (token.kind === ",") {
+      current += ",";
+      flush();
+      continue;
+    }
+    if (token.kind === ":") {
+      current = current.trimEnd() + ": ";
+      continue;
+    }
+    current += token.value;
+  }
+  flush();
+  return { available: true, text: lines.join("\n"), diagnostic: null };
+}
+
+function lightTheme(increaseContrast) {
+  const foreground = increaseContrast ? "#111111" : "#24292f";
+  const background = increaseContrast ? "#ffffff" : "#fbfbfc";
+  return EditorView.theme({
+    "&": { colorScheme: "light", backgroundColor: background, color: foreground },
+    ".cm-content": { caretColor: foreground },
+    ".cm-gutters": { backgroundColor: background, color: increaseContrast ? "#333333" : "#6e7781", border: "none" },
+    ".cm-activeLine": { backgroundColor: increaseContrast ? "#eeeeee" : "#f1f3f5" },
+    ".cm-activeLineGutter": { backgroundColor: increaseContrast ? "#eeeeee" : "#f1f3f5" }
   });
 }
 
-function setPlaceholder(value) {
-  editorView.dispatch({
-    effects: placeholderComp.reconfigure(value ? [placeholder(value)] : []),
-  });
+function darkTheme(increaseContrast) {
+  return [oneDark, EditorView.theme({
+    "&": { colorScheme: "dark", backgroundColor: increaseContrast ? "#111111" : "#1e1e1e" },
+    ".cm-content": { caretColor: increaseContrast ? "#ffffff" : "#d4d4d4" }
+  })];
 }
 
-function setReadOnly(value) {
-  editorView.dispatch({
-    effects: readOnly.reconfigure(value ? EditorState.readOnly.of(true) : []),
-  });
+function languageExtension(language, text) {
+  if (!isAnalysisAvailable(text)) {
+    return [];
+  }
+  switch (language) {
+  case "json":
+    return json();
+  case "xml":
+    return xml();
+  case "graphql":
+    return graphql();
+  default:
+    return [];
+  }
 }
 
-function setLineWrapping(enabled) {
-  editorView.dispatch({
-    effects: lineWrapping.reconfigure(enabled ? EditorView.lineWrapping : []),
-  });
+function selectionValue(selection) {
+  return {
+    anchorUTF16: selection.anchor,
+    headUTF16: selection.head
+  };
 }
 
-function setLineNumber(enabled) {
-  editorView.dispatch({
-    effects: lineNumber.reconfigure(enabled ? lineNumbers() : []),
-  });
+function compositionValue(phase) {
+  if (phase === "none") {
+    return { phase: "none", id: null };
+  }
+  return { phase: phase.phase, id: phase.id };
 }
 
-function setEnabledSearch(enabled) {
-  editorView.dispatch({
-    effects: searchKeymapComp.reconfigure(enabled ? keymap.of([ ...searchKeymap ]) : []),
-  });
+function twoSpaceIndent(view) {
+  const changes = [];
+  for (const range of view.state.selection.ranges) {
+    const first = view.state.doc.lineAt(range.from).number;
+    const last = view.state.doc.lineAt(range.to).number;
+    for (let lineNumber = first; lineNumber <= last; lineNumber += 1) {
+      changes.push({ from: view.state.doc.line(lineNumber).from, insert: "  " });
+    }
+  }
+  if (changes.length > 0) {
+    view.dispatch({ changes });
+  }
+  return true;
 }
 
-function setHighlightActiveLine(enabled) {
-  editorView.dispatch({
-    effects: highlightActiveLineComp.reconfigure(enabled ? [highlightActiveLine()] : []),
-  });
+function twoSpaceOutdent(view) {
+  const changes = [];
+  for (const range of view.state.selection.ranges) {
+    const first = view.state.doc.lineAt(range.from).number;
+    const last = view.state.doc.lineAt(range.to).number;
+    for (let lineNumber = first; lineNumber <= last; lineNumber += 1) {
+      const line = view.state.doc.line(lineNumber);
+      const whitespace = line.text.match(/^ {1,2}/)?.[0] ?? "";
+      if (whitespace.length > 0) {
+        changes.push({ from: line.from, to: line.from + whitespace.length });
+      }
+    }
+  }
+  if (changes.length > 0) {
+    view.dispatch({ changes });
+  }
+  return true;
 }
 
-function setFoldGutter(enabled) {
-  editorView.dispatch({
-    effects: foldGutterComp.reconfigure(enabled ? foldGutter() : []),
-  });
+class EditorController {
+  constructor(postMessage, documentRef = document) {
+    this.postMessage = postMessage;
+    this.documentRef = documentRef;
+    this.view = null;
+    this.sessionID = null;
+    this.replicaID = null;
+    this.loadID = null;
+    this.configuration = {
+      language: "text",
+      isReadOnly: false,
+      wrapsLines: false,
+      showsLineNumbers: true,
+      maximumPendingTransactions: 64,
+      appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false },
+      editorName: "Code editor"
+    };
+    this.hostText = "";
+    this.hostRevision = 0;
+    this.localRevision = 0;
+    this.pendingTransactions = [];
+    this.pendingAcks = new Map();
+    this.deferredLocalSync = false;
+    this.flushRequests = new Map();
+    this.configured = false;
+    this.initializing = true;
+    this.localEditBeforeConfiguration = false;
+    this.applyingHostChange = false;
+    this.divergent = false;
+    this.composition = { phase: "none", id: null };
+    this.compositionActive = false;
+    this.compositionEnding = false;
+    this.compositionSettlementTimer = null;
+    this.diagnosticsPanel = null;
+    this.diagnosticsScheduled = false;
+    this.languageCompartment = new Compartment();
+    this.appearanceCompartment = new Compartment();
+    this.lineNumberCompartment = new Compartment();
+    this.readOnlyCompartment = new Compartment();
+    this.lineWrappingCompartment = new Compartment();
+    this.foldCompartment = new Compartment();
+    this.listenerCompartment = new Compartment();
+    this.handlers = [];
+    this.focusHandlers = [];
+    this.commandContextHandlers = [];
+    this.commandContextTimer = null;
+    this.commandContextForcePending = false;
+    this.commandContextSequence = 0;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.findContextID = null;
+    this.findFocusActive = false;
+    this.findInput = null;
+    this.findHistory = null;
+    this.findCompositionSettlementTimer = null;
+    this.findBeforeInputExpiryTimer = null;
+    this.contextObserver = null;
+  }
+
+  mount() {
+    const updateListener = EditorView.updateListener.of(update => this.handleUpdate(update));
+    if (this.documentRef.body && this.documentRef.createElement) {
+      this.diagnosticsPanel = this.documentRef.createElement("aside");
+      this.diagnosticsPanel.className = "cm-host-diagnostics";
+      this.diagnosticsPanel.setAttribute("role", "status");
+      this.diagnosticsPanel.setAttribute("aria-live", "polite");
+      this.diagnosticsPanel.tabIndex = 0;
+      this.diagnosticsPanel.hidden = true;
+      this.documentRef.body.appendChild(this.diagnosticsPanel);
+    }
+    this.view = new EditorView({
+      doc: "",
+      extensions: [
+        indentUnit.of("  "),
+        drawSelection(),
+        dropCursor(),
+        highlightSpecialChars(),
+        highlightActiveLine(),
+        highlightActiveLineGutter(),
+        indentOnInput(),
+        bracketMatching(),
+        closeBrackets(),
+        autocompletion({ override: [context => this.configuration.language === "json" ? jsonLiteralCompletion(context) : null] }),
+        lintGutter(),
+        search(),
+        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        keymap.of([
+          { key: "Ctrl-Tab", run: () => this.sendFocusTraversal(true) },
+          { key: "Ctrl-Shift-Tab", run: () => this.sendFocusTraversal(false) },
+          { key: "Tab", run: twoSpaceIndent },
+          { key: "Shift-Tab", run: twoSpaceOutdent },
+          { key: "Mod-z", run: () => this.sendCommand("undo") },
+          { key: "Mod-y", run: () => this.sendCommand("redo") },
+          { key: "Mod-Shift-z", run: () => this.sendCommand("redo") },
+          { key: "Mod-f", run: view => { openSearchPanel(view); return true; } },
+          ...closeBracketsKeymap,
+          ...completionKeymap,
+          ...foldKeymap,
+          ...lintKeymap,
+          ...searchKeymap
+        ]),
+        this.languageCompartment.of([]),
+        this.appearanceCompartment.of(lightTheme(false)),
+        this.lineNumberCompartment.of(lineNumbers()),
+        this.readOnlyCompartment.of(EditorState.readOnly.of(true)),
+        this.lineWrappingCompartment.of([]),
+        this.foldCompartment.of([]),
+        this.listenerCompartment.of(updateListener)
+      ],
+      parent: this.documentRef.body
+    });
+    this.view.dom.setAttribute("aria-busy", "true");
+    this.installCompositionHandlers();
+    this.installFocusHandlers();
+    this.installCommandContextHandlers();
+    this.post({ type: "ready" });
+  }
+
+  post(message) {
+    if (this.sessionID && this.replicaID && this.loadID && message.type !== "ready") {
+      this.postMessage({
+        ...message,
+        sessionID: this.sessionID,
+        replicaID: this.replicaID,
+        loadID: this.loadID
+      });
+      return;
+    }
+    this.postMessage(message);
+  }
+
+  receive(command) {
+    if (!command || typeof command.type !== "string") {
+      return;
+    }
+    switch (command.type) {
+    case "configure":
+      this.configure(command);
+      break;
+    case "updateConfiguration":
+      this.updateConfiguration(command.configuration);
+      break;
+    case "apply":
+      this.applySnapshot(command, true);
+      break;
+    case "reconcile":
+      this.applySnapshot(command, Boolean(command.preserveLocalChanges));
+      break;
+    case "acknowledge":
+      this.acknowledge(Number(command.revision));
+      break;
+    case "focus":
+      this.view?.focus();
+      break;
+    case "showFind":
+      if (this.view) {
+        openSearchPanel(this.view);
+        this.resetFindHistoryForPanelReopen();
+        this.scheduleCommandContextReport(true);
+      }
+      break;
+    case "routeCommand":
+      this.routeCommand(command);
+      break;
+    case "format":
+      this.format(command.requestID);
+      break;
+    case "flush":
+      this.flush(command.requestID);
+      break;
+    case "selection":
+      this.applySelection(command.selection);
+      break;
+    case "invalidate":
+      this.destroy();
+      break;
+    default:
+      this.post({ type: "failure", code: "transportFailure" });
+    }
+  }
+
+  configure(command) {
+    this.initializing = true;
+    this.configured = false;
+    this.sessionID = command.sessionID;
+    this.replicaID = command.replicaID;
+    this.loadID = command.loadID;
+    this.hostText = command.text;
+    this.hostRevision = Number(command.revision);
+    this.localRevision = this.hostRevision;
+    this.configuration = command.configuration;
+    this.commandContextSequence = 0;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.retireFindHistory();
+    this.updateConfiguration(this.configuration);
+    this.replaceDocument(command.text, command.selections, true);
+    this.localEditBeforeConfiguration = false;
+    this.initializing = false;
+    this.configured = true;
+    this.updateConfiguration(this.configuration);
+    this.scheduleDiagnostics();
+    this.post({ type: "configured" });
+    this.scheduleCommandContextReport(true);
+  }
+
+  updateConfiguration(configuration) {
+    if (!configuration) {
+      return;
+    }
+    this.configuration = { ...this.configuration, ...configuration };
+    if (!this.view) {
+      return;
+    }
+    const text = this.view.state.doc.toString();
+    this.view.dispatch({
+      effects: [
+        this.languageCompartment.reconfigure(languageExtension(this.configuration.language, text)),
+        this.appearanceCompartment.reconfigure(this.configuration.appearance.colorScheme === "dark" ? darkTheme(this.configuration.appearance.increaseContrast) : lightTheme(this.configuration.appearance.increaseContrast)),
+        this.lineNumberCompartment.reconfigure(this.configuration.showsLineNumbers ? lineNumbers() : []),
+        this.readOnlyCompartment.reconfigure(this.initializing || this.configuration.isReadOnly ? EditorState.readOnly.of(true) : []),
+        this.lineWrappingCompartment.reconfigure(this.configuration.wrapsLines ? EditorView.lineWrapping : []),
+        this.foldCompartment.reconfigure(this.configuration.showsLineNumbers ? foldGutter() : [])
+      ]
+    });
+    const name = this.configuration.editorName || "Code editor";
+    const colorScheme = this.configuration.appearance.colorScheme;
+    const cssColorScheme = colorScheme === "dark" || colorScheme === "light" ? colorScheme : "light dark";
+    this.documentRef.documentElement?.style?.setProperty("color-scheme", cssColorScheme);
+    this.documentRef.body?.style?.setProperty("color-scheme", cssColorScheme);
+    this.documentRef.body?.classList?.toggle(
+      "cm-host-reduce-transparency",
+      Boolean(this.configuration.appearance.reduceTransparency)
+    );
+    this.view.dom.setAttribute("aria-label", name);
+    this.view.dom.setAttribute("role", "textbox");
+    this.view.dom.setAttribute("spellcheck", "false");
+    this.view.dom.setAttribute("aria-busy", this.initializing ? "true" : "false");
+    this.view.dom.setAttribute("aria-readonly", (this.initializing || this.configuration.isReadOnly) ? "true" : "false");
+    this.view.dom.style.setProperty("font-family", "ui-monospace, SFMono-Regular, Menlo, monospace");
+    this.view.dom.style.setProperty("transition", this.configuration.appearance.reduceMotion ? "none" : "opacity 120ms ease");
+    this.view.dom.style.setProperty("background", this.configuration.appearance.reduceTransparency ? "Canvas" : "transparent");
+    this.scheduleDiagnostics();
+    this.scheduleCommandContextReport();
+  }
+
+  scheduleDiagnostics() {
+    if (this.diagnosticsScheduled) {
+      return;
+    }
+    this.diagnosticsScheduled = true;
+    Promise.resolve().then(() => {
+      this.diagnosticsScheduled = false;
+      this.refreshDiagnostics();
+    });
+  }
+
+  refreshDiagnostics() {
+    if (!this.view || !this.configured) {
+      return;
+    }
+    const text = this.view.state.doc.toString();
+    const diagnostics = documentDiagnostics(this.configuration.language, text);
+    this.view.dispatch(setDiagnostics(this.view.state, diagnostics));
+    if (!this.diagnosticsPanel) {
+      return;
+    }
+    this.diagnosticsPanel.textContent = diagnostics
+      .map(diagnostic => `${diagnostic.severity}: ${diagnostic.message}`)
+      .join("\n");
+    this.diagnosticsPanel.hidden = diagnostics.length === 0;
+    this.diagnosticsPanel.classList.toggle(
+      "cm-host-diagnostics-info",
+      diagnostics.some(diagnostic => diagnostic.severity === "info")
+    );
+  }
+
+  handleUpdate(update) {
+    if (!update.docChanged) {
+      if (update.selectionSet && this.configured && !this.applyingHostChange && !this.deferredLocalSync) {
+        this.post({ type: "selection", revision: this.localRevision, selection: selectionValue(update.state.selection.main) });
+      }
+      return;
+    }
+    this.scheduleDiagnostics();
+    if (this.applyingHostChange) {
+      this.scheduleCommandContextReport();
+      return;
+    }
+    if (!this.configured) {
+      this.localEditBeforeConfiguration = true;
+      return;
+    }
+    const changes = [];
+    update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+      changes.push({
+        fromUTF16: fromA,
+        toUTF16: toA,
+        insertedText: inserted.toString(),
+        removedText: update.startState.doc.sliceString(fromA, toA)
+      });
+    });
+    const baseRevision = this.localRevision;
+    const revision = baseRevision + 1;
+    this.localRevision = revision;
+    const transaction = {
+      type: "transaction",
+      baseRevision,
+      revision,
+      changes,
+      selectionBefore: selectionValue(update.startState.selection.main),
+      selectionAfter: selectionValue(update.state.selection.main),
+      composition: compositionValue(this.composition)
+    };
+    if (this.deferredLocalSync) {
+      this.settleCompositionAfterUpdate();
+      this.tryFinishFlushes();
+      return;
+    }
+    const maximum = Math.max(1, Number(this.configuration.maximumPendingTransactions) || 64);
+    if (this.pendingAcks.size + this.pendingTransactions.length >= maximum) {
+      this.deferredLocalSync = true;
+      this.pendingTransactions = [];
+      this.settleCompositionAfterUpdate();
+      this.tryFinishFlushes();
+      return;
+    }
+    this.enqueueTransaction(transaction);
+    if (this.composition.phase === "ended") {
+      this.composition = { phase: "none", id: null };
+    } else if (this.compositionActive && this.composition.phase === "began") {
+      this.composition = { phase: "updated", id: this.composition.id };
+    }
+    this.settleCompositionAfterUpdate();
+    this.scheduleDiagnostics();
+    this.scheduleCommandContextReport();
+    this.tryFinishFlushes();
+  }
+
+  enqueueTransaction(transaction) {
+    this.pendingTransactions.push(transaction);
+    this.pumpTransactions();
+  }
+
+  pumpTransactions() {
+    const maximum = Math.max(1, Number(this.configuration.maximumPendingTransactions) || 64);
+    while (this.pendingTransactions.length > 0 && this.pendingAcks.size < maximum) {
+      const transaction = this.pendingTransactions.shift();
+      this.pendingAcks.set(transaction.revision, transaction);
+      this.post(transaction);
+    }
+  }
+
+  acknowledge(revision) {
+    const transaction = this.pendingAcks.get(revision);
+    if (!transaction) {
+      return;
+    }
+    try {
+      this.hostText = applyChanges(this.hostText, transaction.changes);
+    } catch {
+      this.deferredLocalSync = true;
+    }
+    this.pendingAcks.delete(revision);
+    this.hostRevision = Math.max(this.hostRevision, revision);
+    this.pumpTransactions();
+    this.scheduleCommandContextReport();
+    this.tryFinishFlushes();
+  }
+
+  applySnapshot(command, preserveLocalChanges) {
+    const hasLocalWork = this.deferredLocalSync || this.pendingAcks.size > 0 || this.pendingTransactions.length > 0 || this.localRevision > Number(command.revision);
+    if (preserveLocalChanges && hasLocalWork) {
+      this.divergent = true;
+      this.post({ type: "failure", code: "conflictingEdit" });
+      this.tryFinishFlushes();
+      return;
+    }
+    this.retireFindHistory();
+    this.replaceDocument(command.text, command.selections, true);
+    this.hostText = command.text;
+    this.hostRevision = Number(command.revision);
+    this.localRevision = this.hostRevision;
+    this.pendingAcks.clear();
+    this.pendingTransactions = [];
+    this.deferredLocalSync = false;
+    this.divergent = false;
+    this.scheduleDiagnostics();
+    this.scheduleCommandContextReport(true);
+    this.tryFinishFlushes();
+  }
+
+  replaceDocument(text, selections, suppressEvents) {
+    if (!this.view || this.view.state.doc.toString() === text) {
+      this.applySelections(selections);
+      return;
+    }
+    this.applyingHostChange = suppressEvents;
+    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+    this.applyingHostChange = false;
+    this.applySelections(selections);
+  }
+
+  applySelections(selections) {
+    if (!this.view || !Array.isArray(selections)) {
+      return;
+    }
+    const own = selections.find(selection => selection.replicaID === this.replicaID);
+    if (!own) {
+      return;
+    }
+    const limit = this.view.state.doc.length;
+    const anchor = Math.min(Math.max(Number(own.anchorUTF16), 0), limit);
+    const head = Math.min(Math.max(Number(own.headUTF16), 0), limit);
+    this.applyingHostChange = true;
+    this.view.dispatch({ selection: EditorSelection.single(anchor, head) });
+    this.applyingHostChange = false;
+  }
+
+  applySelection(selection) {
+    if (!this.view || !selection) {
+      return;
+    }
+    const limit = this.view.state.doc.length;
+    const anchor = Math.min(Math.max(Number(selection.anchorUTF16), 0), limit);
+    const head = Math.min(Math.max(Number(selection.headUTF16), 0), limit);
+    this.applyingHostChange = true;
+    this.view.dispatch({ selection: EditorSelection.single(anchor, head) });
+    this.applyingHostChange = false;
+  }
+
+  sendFullLocalTransaction(baseText, localText) {
+    const baseRevision = this.hostRevision;
+    const revision = baseRevision + 1;
+    this.localRevision = revision;
+    this.enqueueTransaction({
+      type: "transaction",
+      baseRevision,
+      revision,
+      changes: [{ fromUTF16: 0, toUTF16: baseText.length, insertedText: localText, removedText: baseText }],
+      selectionBefore: { anchorUTF16: 0, headUTF16: 0 },
+      selectionAfter: selectionValue(this.view.state.selection.main),
+      composition: { phase: "none", id: null }
+    });
+  }
+
+  sendCommand(command) {
+    if (!this.configured) {
+      return true;
+    }
+    this.post({ type: "command", revision: this.localRevision, command });
+    return true;
+  }
+
+  routeCommand(command) {
+    const commandName = command?.command;
+    const requestID = command?.requestID;
+    const expectedRevision = Number(command?.expectedRevision);
+    const expectation = command?.expectation === "find"
+      ? { scope: "find", contextID: command.findContextID }
+      : command?.expectation === "contentOrCurrentFind"
+        ? { scope: "contentOrCurrentFind", contextID: null }
+        : null;
+    let result = "unavailable";
+    if (requestID && (commandName === "undo" || commandName === "redo")
+      && Number.isInteger(expectedRevision) && expectedRevision === this.localRevision
+      && expectation) {
+      if (expectation.scope === "find") {
+        const input = this.exactFindInput();
+        if (input && expectation.contextID === this.ensureFindContext(input)) {
+          result = this.performFindHistory(commandName, input, expectation.contextID)
+            ? "handledByEmbeddedControl" : "unavailable";
+        }
+      } else {
+        const input = this.exactFindInput();
+        if (input) {
+          result = this.performFindHistory(commandName, input, this.ensureFindContext(input))
+            ? "handledByEmbeddedControl" : "unavailable";
+        } else if (this.isContentFocused()) {
+          result = "forwardedToHost";
+        }
+      }
+    }
+    this.post({
+      type: "commandRouteResult",
+      requestID,
+      revision: this.localRevision,
+      command: commandName,
+      expectation: expectation?.scope,
+      findContextID: expectation?.contextID ?? null,
+      result
+    });
+  }
+
+  sendFocusTraversal(forward) {
+    if (!this.configured) {
+      return true;
+    }
+    this.post({ type: "focusTraversal", direction: forward ? "next" : "previous" });
+    return true;
+  }
+
+  format(requestID) {
+    const text = this.view?.state.doc.toString() ?? "";
+    if (this.configuration.language !== "json" || !isAnalysisAvailable(text)) {
+      this.post({ type: "formatResult", requestID, success: false });
+      return;
+    }
+    const result = formatJSON(text);
+    if (!result.available) {
+      this.post({ type: "formatResult", requestID, success: false });
+      return;
+    }
+    if (result.text !== text) {
+      this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: result.text } });
+    }
+    this.scheduleDiagnostics();
+    this.post({ type: "formatResult", requestID, success: true });
+  }
+
+  flush(requestID) {
+    this.flushRequests.set(requestID, true);
+    this.tryFinishFlushes();
+  }
+
+  tryFinishFlushes() {
+    if (this.divergent) {
+      for (const requestID of this.flushRequests.keys()) {
+        this.flushRequests.delete(requestID);
+        this.post({ type: "flushResult", requestID, success: false, code: "conflictingEdit" });
+      }
+      return;
+    }
+    if (this.compositionActive || this.compositionEnding || this.pendingTransactions.length > 0 || this.pendingAcks.size > 0) {
+      return;
+    }
+    if (this.deferredLocalSync) {
+      this.deferredLocalSync = false;
+      const localText = this.view?.state.doc.toString() ?? "";
+      this.sendFullLocalTransaction(this.hostText, localText);
+      return;
+    }
+    for (const requestID of this.flushRequests.keys()) {
+      this.flushRequests.delete(requestID);
+      this.post({ type: "flushResult", requestID, success: true });
+    }
+  }
+
+  installCompositionHandlers() {
+    if (!this.view) {
+      return;
+    }
+    const start = () => {
+      const id = crypto.randomUUID();
+      this.composition = { phase: "began", id };
+      this.compositionActive = true;
+      this.scheduleCommandContextReport(true);
+    };
+    const update = () => {
+      if (this.compositionActive && this.composition.id) {
+        this.composition = { phase: "updated", id: this.composition.id };
+      }
+    };
+    const end = () => {
+      if (this.compositionActive && this.composition.id) {
+        this.composition = { phase: "ended", id: this.composition.id };
+      }
+      this.compositionEnding = true;
+      this.compositionActive = false;
+      this.scheduleCompositionSettlement();
+      this.scheduleCommandContextReport(true);
+    };
+    this.view.dom.addEventListener("compositionstart", start);
+    this.view.dom.addEventListener("compositionupdate", update);
+    this.view.dom.addEventListener("compositionend", end);
+    this.handlers = [["compositionstart", start], ["compositionupdate", update], ["compositionend", end]];
+  }
+
+  scheduleCompositionSettlement() {
+    if (this.compositionSettlementTimer !== null) {
+      return;
+    }
+    this.compositionSettlementTimer = setTimeout(() => {
+      this.compositionSettlementTimer = null;
+      if (!this.compositionEnding) {
+        return;
+      }
+      this.compositionEnding = false;
+      this.composition = { phase: "none", id: null };
+      this.scheduleCommandContextReport(true);
+      this.tryFinishFlushes();
+    }, 0);
+  }
+
+  settleCompositionAfterUpdate() {
+    if (!this.compositionEnding) {
+      return;
+    }
+    this.compositionEnding = false;
+    this.composition = { phase: "none", id: null };
+    if (this.compositionSettlementTimer !== null) {
+      clearTimeout(this.compositionSettlementTimer);
+      this.compositionSettlementTimer = null;
+    }
+  }
+
+  installFocusHandlers() {
+    if (!this.documentRef?.addEventListener) {
+      return;
+    }
+    const focusIn = event => {
+      const input = this.exactFindInput();
+      if (input && event.target === input) {
+        this.ensureFindContext(input, !this.findFocusActive && this.findInput === input);
+        this.findFocusActive = true;
+      }
+      this.scheduleCommandContextReport(true);
+    };
+    const focusOut = event => {
+      if (event.target === this.findInput) {
+        this.retireFindHistory();
+      }
+      this.scheduleCommandContextReport(true);
+    };
+    this.documentRef.addEventListener("focusin", focusIn, true);
+    this.documentRef.addEventListener("focusout", focusOut, true);
+    this.focusHandlers = [
+      ["focusin", focusIn],
+      ["focusout", focusOut]
+    ];
+  }
+
+  installCommandContextHandlers() {
+    if (!this.documentRef?.addEventListener) {
+      return;
+    }
+    const beforeInput = event => {
+      const input = this.findInputElement();
+      if (!input || event.target !== input || this.documentRef.activeElement !== input) {
+        return;
+      }
+      const contextID = this.ensureFindContext(input);
+      if (event.inputType === "historyUndo" || event.inputType === "historyRedo") {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+        this.performFindHistory(
+          event.inputType === "historyUndo" ? "undo" : "redo",
+          input,
+          contextID
+        );
+        return;
+      }
+      if (this.findHistory?.applying) {
+        return;
+      }
+      this.clearFindBeforeInput();
+      if (event.isTrusted !== true || event.defaultPrevented) {
+        return;
+      }
+      this.synchronizeFindHistory(input);
+      this.captureFindBeforeInput(event.inputType);
+      this.scheduleCommandContextReport(true);
+    };
+    const input = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput) {
+        return;
+      }
+      this.handleFindInput(findInput, event);
+    };
+    const selectionChange = () => {
+      const findInput = this.exactFindInput();
+      if (!findInput) {
+        return;
+      }
+      const history = this.findHistory;
+      if (!history || history.applying || history.compositionActive || history.compositionEnding) {
+        return;
+      }
+      this.synchronizeFindHistory(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    const keydown = event => {
+      const findInput = this.exactFindInput();
+      if (!findInput || event.target !== findInput || this.documentRef.activeElement !== findInput
+        || !event.metaKey || event.ctrlKey || event.altKey
+        || String(event.key).toLowerCase() !== "z") {
+        return;
+      }
+      const command = event.shiftKey ? "redo" : "undo";
+      const contextID = this.ensureFindContext(findInput);
+      event.preventDefault?.();
+      event.stopImmediatePropagation?.();
+      this.performFindHistory(command, findInput, contextID);
+    };
+    const compositionStart = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || this.documentRef.activeElement !== findInput) {
+        return;
+      }
+      this.ensureFindContext(findInput);
+      this.synchronizeFindHistory(findInput);
+      const history = this.findHistory;
+      if (!history || history.applying) {
+        return;
+      }
+      this.cancelFindCompositionSettlement();
+      history.compositionGeneration += 1;
+      history.compositionStart = history.current;
+      history.compositionActive = true;
+      history.compositionEnding = false;
+      history.compositionCancelled = false;
+      history.compositionAbandoned = history.oversized;
+      this.clearFindBeforeInput();
+      this.scheduleCommandContextReport(true);
+    };
+    const compositionEnd = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || !this.findHistory?.compositionActive) {
+        return;
+      }
+      this.findHistory.compositionActive = false;
+      this.findHistory.compositionEnding = true;
+      this.scheduleFindCompositionSettlement(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    const compositionCancel = event => {
+      const findInput = this.findInputElement();
+      if (!findInput || event.target !== findInput || !this.findHistory?.compositionActive) {
+        return;
+      }
+      this.findHistory.compositionActive = false;
+      this.findHistory.compositionEnding = true;
+      this.findHistory.compositionCancelled = true;
+      this.clearFindBeforeInput();
+      this.scheduleFindCompositionSettlement(findInput);
+      this.scheduleCommandContextReport(true);
+    };
+    this.documentRef.addEventListener("input", input, true);
+    this.documentRef.addEventListener("beforeinput", beforeInput, true);
+    this.documentRef.addEventListener("selectionchange", selectionChange, true);
+    this.documentRef.addEventListener("keydown", keydown, true);
+    this.documentRef.addEventListener("compositionstart", compositionStart, true);
+    this.documentRef.addEventListener("compositionend", compositionEnd, true);
+    this.documentRef.addEventListener("compositioncancel", compositionCancel, true);
+    this.commandContextHandlers = [
+      ["input", input],
+      ["beforeinput", beforeInput],
+      ["selectionchange", selectionChange],
+      ["keydown", keydown],
+      ["compositionstart", compositionStart],
+      ["compositionend", compositionEnd],
+      ["compositioncancel", compositionCancel]
+    ];
+    if (this.documentRef.defaultView?.MutationObserver && this.documentRef.body) {
+      this.contextObserver = new this.documentRef.defaultView.MutationObserver(() => {
+        const input = this.findInputElement();
+        if (input !== this.findInput) {
+          if (input) {
+            this.ensureFindContext(input);
+          } else {
+            this.retireFindHistory();
+          }
+        }
+        this.scheduleCommandContextReport(true);
+      });
+      this.contextObserver.observe(this.documentRef.body, { childList: true, subtree: true });
+    }
+  }
+
+  findInputElement() {
+    return this.documentRef?.querySelector?.(".cm-search input") ?? null;
+  }
+
+  exactFindInput() {
+    const input = this.findInputElement();
+    return input && this.documentRef?.activeElement === input ? input : null;
+  }
+
+  resetFindHistoryForPanelReopen() {
+    const input = this.findInputElement();
+    if (!input) {
+      this.retireFindHistory();
+      return;
+    }
+    this.resetFindHistory(input, this.findSnapshot(input));
+    this.findFocusActive = this.documentRef.activeElement === input;
+  }
+
+  ensureFindContext(input, resetExisting = false) {
+    if (this.findInput !== input || !this.findContextID || resetExisting || !this.findHistory) {
+      this.resetFindHistory(input, this.findSnapshot(input));
+    }
+    return this.findContextID;
+  }
+
+  makeFindHistory(snapshot) {
+    const oversized = snapshot.value.length > MAX_FIND_HISTORY_UNITS;
+    return {
+      current: oversized ? null : snapshot,
+      undo: [],
+      redo: [],
+      pendingBeforeInput: null,
+      pendingGeneration: 0,
+      compositionStart: null,
+      compositionGeneration: 0,
+      compositionActive: false,
+      compositionEnding: false,
+      compositionCancelled: false,
+      compositionAbandoned: false,
+      applying: false,
+      oversized
+    };
+  }
+
+  resetFindHistory(input, snapshot) {
+    this.clearFindBeforeInput();
+    this.cancelFindCompositionSettlement();
+    this.findInput = input;
+    this.findContextID = crypto.randomUUID();
+    this.findHistory = this.makeFindHistory(snapshot);
+  }
+
+  retireFindHistory() {
+    this.clearFindBeforeInput();
+    this.cancelFindCompositionSettlement();
+    this.findContextID = null;
+    this.findFocusActive = false;
+    this.findInput = null;
+    this.findHistory = null;
+  }
+
+  cancelFindCompositionSettlement() {
+    if (this.findCompositionSettlementTimer !== null) {
+      clearTimeout(this.findCompositionSettlementTimer);
+      this.findCompositionSettlementTimer = null;
+    }
+  }
+
+  findSnapshot(input) {
+    const value = String(input?.value ?? "");
+    const selectionStart = Number.isInteger(input?.selectionStart)
+      ? Math.max(0, Math.min(value.length, input.selectionStart))
+      : value.length;
+    const selectionEnd = Number.isInteger(input?.selectionEnd)
+      ? Math.max(selectionStart, Math.min(value.length, input.selectionEnd))
+      : selectionStart;
+    return {
+      value,
+      selectionStart,
+      selectionEnd,
+      selectionDirection: input?.selectionDirection === "backward" ? "backward" : "forward"
+    };
+  }
+
+  sameFindSnapshot(first, second) {
+    return Boolean(first && second) && first.value === second.value
+      && first.selectionStart === second.selectionStart
+      && first.selectionEnd === second.selectionEnd
+      && first.selectionDirection === second.selectionDirection;
+  }
+
+  findHistoryUnits(history, current = history.current) {
+    const snapshots = new Set([
+      current, ...history.undo, ...history.redo,
+      history.pendingBeforeInput?.before, history.compositionStart
+    ]);
+    let units = 0;
+    for (const snapshot of snapshots) {
+      units += snapshot?.value.length ?? 0;
+    }
+    return units;
+  }
+
+  trimFindHistory(history, current = history.current) {
+    const bounded = current && current.value.length <= MAX_FIND_HISTORY_UNITS ? current : null;
+    if (!bounded) {
+      this.abandonFindComposition(history);
+    }
+    while (history.undo.length + history.redo.length > MAX_FIND_HISTORY_SNAPSHOTS
+      || this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      if (history.undo.length > 0) {
+        history.undo.shift();
+      } else if (history.redo.length > 0) {
+        history.redo.shift();
+      } else {
+        break;
+      }
+    }
+    if (this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      this.clearFindBeforeInput();
+    }
+    if (this.findHistoryUnits(history, bounded) > MAX_FIND_HISTORY_UNITS) {
+      this.abandonFindComposition(history);
+    }
+    history.current = bounded;
+    history.oversized = !bounded;
+  }
+
+  abandonFindComposition(history) {
+    history.undo = [];
+    history.redo = [];
+    this.clearFindBeforeInput();
+    history.compositionStart = null;
+    history.compositionAbandoned = true;
+  }
+
+  synchronizeFindHistory(input) {
+    const history = this.findHistory;
+    const live = this.findSnapshot(input);
+    if (this.sameFindSnapshot(history.current, live)) {
+      return;
+    }
+    if (live.value !== history.current?.value) {
+      if (!history.compositionActive && !history.compositionEnding) {
+        this.resetFindHistory(input, live);
+        return;
+      }
+      this.abandonFindComposition(history);
+    }
+    this.trimFindHistory(history, live);
+  }
+
+  captureFindBeforeInput(inputType) {
+    this.clearFindBeforeInput();
+    const history = this.findHistory;
+    if (!history.current) {
+      return;
+    }
+    const contextID = this.findContextID;
+    const generation = ++history.pendingGeneration;
+    history.pendingBeforeInput = {
+      contextID,
+      generation,
+      inputType: String(inputType || ""),
+      before: history.current
+    };
+    this.expireFindBeforeInput(contextID, generation);
+  }
+
+  expireFindBeforeInput(contextID, generation) {
+    const timer = setTimeout(() => {
+      if (this.findBeforeInputExpiryTimer !== timer) {
+        return;
+      }
+      this.findBeforeInputExpiryTimer = null;
+      const history = this.findHistory;
+      const pending = history?.pendingBeforeInput;
+      if (this.findContextID === contextID
+        && pending?.contextID === contextID
+        && pending?.generation === generation
+        && history.pendingGeneration === generation) {
+        history.pendingBeforeInput = null;
+      }
+    }, 0);
+    this.findBeforeInputExpiryTimer = timer;
+  }
+
+  clearFindBeforeInput() {
+    if (this.findBeforeInputExpiryTimer !== null) {
+      clearTimeout(this.findBeforeInputExpiryTimer);
+      this.findBeforeInputExpiryTimer = null;
+    }
+    if (this.findHistory) {
+      this.findHistory.pendingBeforeInput = null;
+    }
+  }
+
+  recordFindInputTransition(input, before, after) {
+    const history = this.findHistory;
+    if (!history || history.applying) {
+      return;
+    }
+    if (after.value.length > MAX_FIND_HISTORY_UNITS || before.value.length > MAX_FIND_HISTORY_UNITS) {
+      this.resetFindHistory(input, after);
+      this.findHistory.oversized = true;
+      return;
+    }
+    history.undo.push(before);
+    history.redo = [];
+    this.trimFindHistory(history, after);
+  }
+
+  handleFindInput(input, event) {
+    if (this.findInput !== input || !this.findContextID) {
+      this.ensureFindContext(input);
+    }
+    const history = this.findHistory;
+    if (!history) {
+      return;
+    }
+    const after = this.findSnapshot(input);
+    if (history.applying) {
+      this.scheduleCommandContextReport(true);
+      return;
+    }
+    const pending = history.pendingBeforeInput;
+    this.clearFindBeforeInput();
+    const paired = event?.isTrusted === true
+      && pending?.contextID === this.findContextID
+      && pending?.generation === history.pendingGeneration
+      && pending?.inputType === String(event.inputType || "")
+      && this.sameFindSnapshot(pending?.before, history.current);
+    if (history.compositionActive || history.compositionEnding) {
+      if (!paired) {
+        this.abandonFindComposition(history);
+      }
+      this.trimFindHistory(history, after);
+    } else if (!paired) {
+      this.resetFindHistory(input, after);
+    } else if (!this.sameFindSnapshot(pending.before, after)) {
+      this.recordFindInputTransition(input, pending.before, after);
+    } else {
+      this.trimFindHistory(history, after);
+    }
+    this.scheduleCommandContextReport(true);
+  }
+
+  scheduleFindCompositionSettlement(input) {
+    this.cancelFindCompositionSettlement();
+    const contextID = this.findContextID;
+    const generation = this.findHistory.compositionGeneration;
+    const timer = setTimeout(() => {
+      if (this.findCompositionSettlementTimer !== timer) {
+        return;
+      }
+      this.findCompositionSettlementTimer = null;
+      const history = this.findHistory;
+      if (!history || this.findInput !== input || this.findContextID !== contextID
+        || history.compositionGeneration !== generation || !history.compositionEnding) {
+        return;
+      }
+      const after = this.findSnapshot(input);
+      const before = history.compositionStart;
+      const cancelled = history.compositionCancelled;
+      history.compositionStart = null;
+      history.compositionEnding = false;
+      history.compositionCancelled = false;
+      this.clearFindBeforeInput();
+      if (history.compositionAbandoned) {
+        this.resetFindHistory(input, after);
+      } else if (cancelled && before) {
+        this.applyFindSnapshot(input, before, contextID);
+      } else if (before && !this.sameFindSnapshot(before, after)) {
+        this.recordFindInputTransition(input, before, after);
+      } else {
+        this.trimFindHistory(history, after);
+      }
+      this.scheduleCommandContextReport(true);
+    }, 0);
+    this.findCompositionSettlementTimer = timer;
+  }
+
+  isContentFocused() {
+    const activeElement = this.documentRef?.activeElement;
+    const content = this.view?.contentDOM ?? this.view?.dom?.querySelector?.(".cm-content");
+    return Boolean(activeElement && content && activeElement === content);
+  }
+
+  findCommandAvailability(command) {
+    const input = this.exactFindInput();
+    const history = this.findHistory;
+    if (!input || !history || history.oversized || history.compositionActive || history.compositionEnding) {
+      return { isSupported: false, isEnabled: false };
+    }
+    return {
+      isSupported: true,
+      isEnabled: command === "undo" ? history.undo.length > 0 : history.redo.length > 0
+    };
+  }
+
+  currentCommandContext() {
+    const input = this.exactFindInput();
+    if (input) {
+      const contextID = this.ensureFindContext(input);
+      const undo = this.findCommandAvailability("undo");
+      const redo = this.findCommandAvailability("redo");
+      return {
+        scope: "find",
+        findContextID: contextID,
+        undoSupported: undo.isSupported,
+        undoEnabled: undo.isEnabled,
+        redoSupported: redo.isSupported,
+        redoEnabled: redo.isEnabled
+      };
+    }
+    if (this.isContentFocused()) {
+      return {
+        scope: "content",
+        findContextID: null,
+        undoSupported: false,
+        undoEnabled: false,
+        redoSupported: false,
+        redoEnabled: false
+      };
+    }
+    return {
+      scope: "unavailable",
+      findContextID: null,
+      undoSupported: false,
+      undoEnabled: false,
+      redoSupported: false,
+      redoEnabled: false
+    };
+  }
+
+  scheduleCommandContextReport(force = false) {
+    this.commandContextForcePending ||= force;
+    if (this.commandContextTimer !== null) {
+      return;
+    }
+    this.commandContextTimer = Promise.resolve().then(() => {
+      this.commandContextTimer = null;
+      const shouldForce = this.commandContextForcePending;
+      this.commandContextForcePending = false;
+      this.reportCommandContext(shouldForce);
+    });
+  }
+
+  reportCommandContext(force = false) {
+    if (!this.configured || !this.sessionID || !this.replicaID || !this.loadID) {
+      return;
+    }
+    const context = this.currentCommandContext();
+    const revision = this.localRevision;
+    const signature = JSON.stringify(context);
+    if (!force && signature === this.reportedCommandContext
+      && revision === this.reportedCommandContextRevision) {
+      return;
+    }
+    this.reportedCommandContext = signature;
+    this.reportedCommandContextRevision = revision;
+    this.commandContextSequence += 1;
+    this.post({
+      type: "commandContext",
+      revision,
+      contextSequence: this.commandContextSequence,
+      commandScope: context.scope,
+      findContextID: context.findContextID,
+      undoSupported: context.undoSupported,
+      undoEnabled: context.undoEnabled,
+      redoSupported: context.redoSupported,
+      redoEnabled: context.redoEnabled
+    });
+  }
+
+  performFindHistory(command, input, contextID) {
+    if (!input || this.documentRef.activeElement !== input
+      || contextID !== this.ensureFindContext(input)
+      || !this.findHistory
+      || this.findHistory.oversized
+      || this.findHistory.compositionActive
+      || this.findHistory.compositionEnding) {
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const history = this.findHistory;
+    const source = command === "undo" ? history.undo : history.redo;
+    const destination = command === "undo" ? history.redo : history.undo;
+    if (source.length === 0) {
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const current = this.findSnapshot(input);
+    if (!this.sameFindSnapshot(current, history.current)) {
+      this.resetFindHistory(input, current);
+      this.scheduleCommandContextReport(true);
+      return false;
+    }
+    const target = source.pop();
+    destination.push(history.current);
+    return this.applyFindSnapshot(input, target, contextID);
+  }
+
+  applyFindSnapshot(input, target, contextID) {
+    const history = this.findHistory;
+    if (!history || this.exactFindInput() !== input || contextID !== this.findContextID) {
+      return false;
+    }
+    this.clearFindBeforeInput();
+    history.applying = true;
+    let applied = false;
+    try {
+      input.value = target.value;
+      input.setSelectionRange(target.selectionStart, target.selectionEnd, target.selectionDirection);
+      applied = true;
+    } catch {
+      applied = false;
+    }
+    try {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      applied = applied && this.exactFindInput() === input && this.findContextID === contextID
+        && this.sameFindSnapshot(this.findSnapshot(input), target);
+    } catch {
+      applied = false;
+    } finally {
+      history.applying = false;
+    }
+    if (this.findContextID === contextID) {
+      if (applied) {
+        this.trimFindHistory(history, target);
+      } else {
+        this.resetFindHistory(input, this.findSnapshot(input));
+      }
+    }
+    this.scheduleCommandContextReport(true);
+    return applied;
+  }
+
+  destroy() {
+    if (this.documentRef?.removeEventListener) {
+      for (const [name, handler] of this.focusHandlers) {
+        this.documentRef.removeEventListener(name, handler, true);
+      }
+    }
+    this.focusHandlers = [];
+    this.commandContextTimer = null;
+    this.commandContextForcePending = false;
+    this.reportedCommandContext = null;
+    this.reportedCommandContextRevision = null;
+    this.retireFindHistory();
+    for (const [name, handler] of this.commandContextHandlers) {
+      this.documentRef?.removeEventListener(name, handler, true);
+    }
+    this.commandContextHandlers = [];
+    this.contextObserver?.disconnect?.();
+    this.contextObserver = null;
+    this.configured = false;
+    this.initializing = true;
+    this.sessionID = null;
+    this.replicaID = null;
+    this.loadID = null;
+    if (this.view) {
+      for (const [name, handler] of this.handlers) {
+        this.view.dom.removeEventListener(name, handler);
+      }
+      this.view.destroy();
+    }
+    if (this.compositionSettlementTimer !== null) {
+      clearTimeout(this.compositionSettlementTimer);
+      this.compositionSettlementTimer = null;
+    }
+    this.diagnosticsPanel?.remove();
+    this.diagnosticsPanel = null;
+    this.diagnosticsScheduled = false;
+    this.view = null;
+    this.flushRequests.clear();
+    this.pendingTransactions = [];
+    this.pendingAcks.clear();
+    this.deferredLocalSync = false;
+  }
 }
 
-function setFontSize(size) {
-  editorView.dispatch({
-    effects: fontSizeComp.reconfigure(fontSizeTheme(size)),
-  });
+let controller;
+
+export function start(postMessage = message => window.webkit.messageHandlers.codeMirrorHost.postMessage(message), documentRef = document) {
+  controller = new EditorController(postMessage, documentRef);
+  controller.mount();
+  return controller;
 }
 
-function setFocus() {
-  editorView.focus();
+export function receive(command) {
+  controller?.receive(command);
 }
 
-function setBlur() {
-  editorView.dom.blur()
-}
-
-export {
-  setLanguage,
-  getSupportedLanguages,
-  setPlaceholder,
-  setContent,
-  getContent,
-  setListener,
-  setReadOnly,
-  setTheme,
-  setLineWrapping,
-  setLineNumber,
-  setHighlightActiveLine,
-  setFoldGutter,
-  setEnabledSearch,
-  setFocus,
-  setBlur,
-  setFontSize,
-  editorView,
-};
+export { EditorController };

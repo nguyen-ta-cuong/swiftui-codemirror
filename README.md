@@ -36,308 +36,78 @@
 </div>
 <hr>
 
-CodeMirror
-===
+# CodeMirror
+
+SwiftUI CodeMirror 6 transport for native macOS and iOS editors. The package owns the bundled WebKit page and JavaScript bridge while the host owns the authoritative text, document undo, validation, and session lifetime.
 
 [![Buy me a coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://jaywcjlove.github.io/#/sponsor)
 [![Follow On X](https://img.shields.io/badge/Follow%20on%20X-333333?logo=x&logoColor=white)](https://x.com/jaywcjlove)
 
 ![CodeMirror for macOS/iOS](https://github.com/user-attachments/assets/2d25564c-bb2b-4297-a4c5-1db03d13a5ce)
 
-SwiftUI wrapper for CodeMirror 6.
+## Swift package
 
-## Features
-
-- Minimal and fast
-- Handles large documents with ease
-- [40+ themes](https://uiwjs.github.io/react-codemirror/#/theme) available
-- macOS & iOS support
-- Built with SwiftUI
-
-## Installation
-
-### Swift Package Manager
-
-Add CodeMirror to your project using Xcode:
-
-1. In Xcode, go to `File` → `Add Package Dependencies...`
-2. Enter the repository URL: `https://github.com/jaywcjlove/swiftui-codemirror.git`
-3. Click `Add Package`
-
-Or add it to your `Package.swift` file:
+Add the package as a local or remote Swift package and import `CodeMirror`.
 
 ```swift
-dependencies: [
-    .package(url: "https://github.com/jaywcjlove/swiftui-codemirror.git", from: "1.0.0")
-]
-```
-
-## Usage
-
-### CodeMirror
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value, prompt: String(localized: "Please enter text"))
-        CodeMirror(value: $value)
-            .onLoadSuccess() {
-                print("Hello!")
-            }
-            .onLoadFailed { error in
-                print("@@@2 \(#function) \(error)")
-            }
-            .onContentChange { value in
-                print("@@@3 Content Did Change")
-            }
+let session = CodeMirrorSession(
+    initialText: "{\"enabled\":true}",
+    configuration: CodeMirrorConfiguration(
+        language: .json,
+        editorName: "Response body"
+    )
+) { event in
+    switch event {
+    case .transaction(_, let snapshot):
+        return .accept
+    default:
+        return .accept
     }
 }
+
+CodeMirrorEditor(session: session)
 ```
 
-**Set Line Wrapping**
+`CodeMirrorSession` is main-actor owned. Its event callback is synchronous so a host reducer can accept a transaction, replace it with authoritative text, or invalidate the session before the WebKit replica receives an acknowledgement. `CodeMirrorChange` ranges and selections use UTF-16 offsets; inbound changes must carry the source preimage, which the session validates and normalizes before acceptance.
 
-```swift
-struct ContentView: View {
-    @State var lineWrapping = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLineWrapping($lineWrapping)
-    }
-}
+Use `flush()` before saving, exporting, running, navigating, or tearing down an editor. Use `replace` for host-owned undo and redo; those replacements update replicas without generating editor events or WebKit history entries. When a reducer must apply an undo or redo replacement synchronously, `replaceImmediately(expectedRevision:changes:selection:in:)` performs the same atomic validation and replica update without an async suspension. `focusedReplicaID()` checks the current native key-window responder synchronously and returns no replica for an unmounted, hidden, inactive, invalidated, or native-form-focused view.
+
+The supported language values are `.text`, `.json`, `.xml`, and `.graphql`. JSON formatting is lexical: it preserves number lexemes, key order, duplicate keys, and string escapes. Documents larger than 1 MiB remain editable in plain mode while syntax analysis and formatting report unavailable.
+
+## Native editing commands
+
+`focusedReplicaID()` reports the native key-window owner, while `focusedCommandContext()` reports trusted content or exact Find focus and Find Undo/Redo availability. A native-focused replica without a current trusted report is `.unavailable`; native fields and unrelated responders remain outside the CodeMirror command context.
+
+For nil-target Undo/Redo, the host uses a weak per-window registration and immutable content or Find targets. Content targets route with `.contentOrCurrentFind`; a retained Find target carries its opaque `CodeMirrorFindCommandContextID` and routes with `.find(...)`, so it cannot become document Undo after focus moves. Hosts must validate the current key window, replica, context identity, and availability before dispatching `routeCommand(_:in:expecting:)`; native fields use normal responder-chain fallthrough.
+
+`forwardedToHost` emits exactly one existing `CodeMirrorEvent.command`. The host sends that event through flush-before-Undo preparation and the shared document `UndoManager`; it must not perform a second Undo/Redo from the result. `handledByEmbeddedControl` performs only local Find history and emits no document command; `unavailable` emits none.
+
+Inline and detached editors share their owning document session and `UndoManager`; another document owns a separate manager. Use `replaceImmediately` inside synchronous Undo callbacks and register inverses before the callback returns.
+
+## Local bundle development
+
+The JavaScript source and lockfile live in `codemirrorjs`. Rebuilding the bundle requires Node.js 20 or newer; use `npm ci` to install the locked dependencies.
+
+```sh
+cd codemirrorjs
+npm ci
+npm test
+npm run build
 ```
 
-**Show Line Numbers**
+The build writes the reproducible bundle to `Sources/CodeMirror/web.bundle/codemirror.bundle.js`. Run `npm run generate-notices` after dependency changes; it deterministically walks the entry-point imports, verifies each bundled runtime package against the committed lockfile, and copies its installed license/notice text into `Sources/CodeMirror/web.bundle/THIRD-PARTY-NOTICES.md`. The notice inventory also lists locked build-only and optional packages separately, without treating their metadata as runtime notices. The HTML page uses a non-networking local-only CSP and the native wrapper uses a nonpersistent WebKit data store. No application source or body text is interpolated into JavaScript source.
 
-```swift
-struct ContentView: View {
-    @State var lineNumber = true
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLineNumber($lineNumber)
-    }
-}
-```
+## Provenance
 
-**Show Fold Gutter**
-
-```swift
-struct ContentView: View {
-    @State var foldGutter = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmFoldGutter($foldGutter)
-    }
-}
-```
-
-**Set Editor Read-Only**
-
-```swift
-struct ContentView: View {
-    @State var readOnly = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmReadOnly($readOnly)
-    }
-}
-```
-
-**Set enabled search**
-
-```swift
-struct ContentView: View {
-    @State var enabledSearch = false
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmEnabledSearch(.constant(false))
-    }
-}
-```
-
-**Set Font Size**
-
-```swift
-CodeMirror(value: $value)
-    .cmFontSize(.constant(14))
-```
-
-**Set Highlight Active Line**
-
-```swift
-CodeMirror(value: $value)
-    .cmHighlightActiveLine(.constant(false))
-```
-
-**Set Programming Language**
-
-```swift
-struct ContentView: View {
-    @State var language: Language = .json
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmLanguage($language)
-    }
-}
-```
-
-Support: `C`, `C++`, `CQL`, `CSS`, `Go`, `HTML`, `Java`, `JavaScript`, `JSON`, `JSX`, `LESS`, `Liquid`, `MariaDB SQL`, `Markdown`, `MS SQL`, `MySQL`, `PHP`, `PLSQL`, `PostgreSQL`, `Python`, `Rust`, `Sass`, `SCSS`, `SQL`, `SQLite`, `TSX`, `TypeScript`, `WebAssembly`, `XML`, `YAML`, `APL`, `PGP`, `ASN.1`, `Asterisk`, `Brainfuck`, `Cobol`, `C#`, `Clojure`, `ClojureScript`, `Closure Stylesheets (GSS)`, `CMake`, `CoffeeScript`, `Common Lisp`, `Cypher`, `Cython`, `Crystal`, `D`, `Dart`, `diff`, `Dockerfile`, `DTD`, `Dylan`, `EBNF`, `ECL`, `edn`, `Eiffel`, `Elm`, `Erlang`, `Esper`, `Factor`, `FCL`, `Forth`, `Fortran`, `F#`, `Gas`, `Gherkin`, `Groovy`, `Haskell`, `Haxe`, `HXML`, `HTTP`, `IDL`, `JSON-LD`, `Jinja2`, `Julia`, `Kotlin`, `LiveScript`, `Lua`, `mIRC`, `Mathematica`, `Modelica`, `MUMPS`, `Mbox`, `Nginx`, `NSIS`, `NTriples`, `Objective-C`, `Objective-C++`, `OCaml`, `Octave`, `Oz`, `Pascal`, `Perl`, `Pig`, `PowerShell`, `Properties files`, `ProtoBuf`, `Pug`, `Puppet`, `Q`, `R`, `RPM Changes`, `RPM Spec`, `Ruby`, `SAS`, `Scala`, `Scheme`, `Shell`, `Sieve`, `Smalltalk`, `Solr`, `SML`, `SPARQL`, `Spreadsheet`, `Squirrel`, `Stylus`, `Swift`, `sTeX`, `LaTeX`, `SystemVerilog`, `Tcl`, `Textile`, `TiddlyWiki`, `Tiki wiki`, `TOML`, `Troff`, `TTCN`, `TTCN_CFG`, `Turtle`, `Web IDL`, `VB.NET`, `VBScript`, `Velocity`, `Verilog`, `VHDL`, `XQuery`, `Yacas`, `Z80`, `MscGen`, `Xù`, `MsGenny`, `Vue`, `Angular Template`,
-
-**Set Theme**
-
-```swift
-struct ContentView: View {
-    @Environment(\.colorScheme) var colorScheme
-    @State var theme: Themes = .vscodelight
-    @State var value: String = ""
-    var body: some View {
-        CodeMirror(value: $value)
-            .cmTheme($theme)
-            .cmTheme(
-                colorScheme == .dark ? .constant(.vscodedark) : .constant(.vscodelight)
-            )
-    }
-}
-```
-
-### CodeMirrorView
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @ObservedObject var vm: CodeMirrorVM = .init()
-    @State var value: String = ""
-    var body: some View {
-        CodeMirrorView(vm, value: $value)
-            .onAppear {
-                vm.setContent(jsonString)
-            }
-    }
-}
-```
-
-**Set Theme**
-
-```swift
-import SwiftUI
-import CodeMirror
-
-struct ContentView: View {
-    @ObservedObject var vm: CodeMirrorVM = .init()
-    @State var value: String = ""
-    var body: some View {
-        VStack {
-            CodeMirrorView(vm, value: $value)
-                .onAppear {
-                    vm.setContent(jsonString)
-                }
-            Picker("Theme", selection: $vm.theme) {
-                ForEach(Themes.allCases, id: \.rawValue) {
-                    Text($0.rawValue).tag($0)
-                }
-            }
-        }
-    }
-}
-```
-
-**Set Programming Language**
-
-```swift
-Picker("Lang", selection: $vm.language) {
-    ForEach(Language.allCases, id: \.rawValue) {
-        Text($0.rawValue).tag($0)
-    }
-}
-```
-
-```swift
-vm.language = .json
-```
-
-**Set Editor Content**
-
-```swift
-Button {
-    vm.setContent("Hello World!")
-} label: {
-    Text("SET")
-}
-```
-
-**Get Editor Text Content**
-
-```swift
-Button {
-    Task {
-        let content = try? await vm.getContent()
-        print(content ?? "")
-    }
-} label: {
-    Text("GET")
-}
-```
-
-**Set Editor Read-Only**
-
-```swift
-Toggle(isOn: $vm.readOnly, label: { Text("Read Only") })
-    .toggleStyle(.checkbox)
-```
-
-**Show Line Numbers**
-
-```swift
-ToolbarItem {
-    Toggle(isOn: $vm.lineNumber, label: { Text("Line Number") })
-        .toggleStyle(.checkbox)
-}
-```
-
-**Set Line Wrapping**
-
-```swift
-ToolbarItem {
-    Toggle(isOn: $vm.lineWrapping, label: { Text("Line Wrapping") })
-        .toggleStyle(.checkbox)
-}
-```
-
-**Event**
-
-```swift
-@ObservedObject var vm: CodeMirrorVM = .init(
-    onLoadSuccess: {
-        print("@@@1 \(#function)")
-    },
-    onLoadFailed: { error in
-        print("@@@2 \(#function) \(error)")
-    },
-    onContentChange: { value in
-        print("@@@3 Content Did Change")
-    }
-)
-```
+This fork is based on `jaywcjlove/swiftui-codemirror` v2.8.3 and retains the upstream acknowledgments and MIT license. CodeMirror 6 language support is provided by the CodeMirror project, `cm6-graphql` from GraphiQL, and the packages recorded in `codemirrorjs/package-lock.json`. The generated notice file is the committed provenance record for bundled runtime dependencies and the complete locked-package inventory; its header records the lockfile hash used to produce it.
 
 ## Acknowledgments
-
-Thanks to these projects:
 
 - https://codemirror.net
 - https://github.com/khoi/codemirror-swift
 - https://github.com/ProxymanApp/CodeMirror-Swift
+- https://github.com/graphql/graphiql/tree/main/packages/cm6-graphql
 
 ## License
 
-Licensed under the MIT License.
+Licensed under the MIT License. See [LICENSE](LICENSE).

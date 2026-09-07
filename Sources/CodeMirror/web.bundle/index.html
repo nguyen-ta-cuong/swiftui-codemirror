@@ -2,59 +2,38 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="initial-scale=1">
-    <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;">
+    <meta name="viewport" content="initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none';" />
     <style>
-      html, body { 
-        margin: 0px; 
-        padding: 0px; 
-        width: 100%; 
-        height: 100%; 
-        /* 优化渲染性能 */
-        will-change: transform;
-        contain: layout;
-      }
-      body { 
-        user-select: none; 
-        -webkit-user-select: none;
-        /* 减少重绘 */
-        backface-visibility: hidden;
-        -webkit-backface-visibility: hidden;
-      }
-      .cm-editor { 
-        width: 100%; 
-        height: 100%;
-        /* 优化滚动性能 */
-        will-change: scroll-position;
-      }
-      .cm-scroller { 
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; color-scheme: light dark; }
+      body { display: flex; flex-direction: column; user-select: none; -webkit-user-select: none; }
+      body.cm-host-reduce-transparency { background: Canvas; }
+      .cm-editor { order: 1; flex: 1 1 auto; min-height: 0; width: 100%; height: auto; }
+      .cm-scroller { min-height: 0; overflow: auto; }
+      .cm-content { user-select: text; -webkit-user-select: text; }
+      .cm-host-diagnostics {
+        order: 2;
+        flex: 0 1 auto;
+        width: 100%;
+        max-height: 5rem;
+        min-height: 0;
         overflow: auto;
-        /* 启用硬件加速 */
-        transform: translateZ(0);
-        -webkit-transform: translateZ(0);
+        box-sizing: border-box;
+        padding: 0.35rem 0.6rem;
+        background: Canvas;
+        color: CanvasText;
+        border-top: 1px solid rgba(128, 128, 128, 0.5);
+        font: 0.75rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap;
+        user-select: text;
+        -webkit-user-select: text;
       }
+      .cm-host-diagnostics[hidden] { display: none; }
+      .cm-host-diagnostics-info { border-top-color: darkorange; }
     </style>
   </head>
   <body>
     <script src="./codemirror.bundle.js"></script>
-    <script>
-      // 使用 requestIdleCallback 来延迟非关键初始化
-      function initializeCodeMirror() {
-        if (window.webkit) {
-          window.webkit.messageHandlers.codeMirrorDidReady.postMessage(null);
-          CodeMirror.setListener(() => {
-              let code = CodeMirror.getContent();
-              window.webkit.messageHandlers.codeMirrorContentDidChange.postMessage(code);
-          });
-        }
-      }
-      
-      // 优先使用 requestIdleCallback，如果不支持则回退到 setTimeout
-      if (window.requestIdleCallback) {
-        requestIdleCallback(initializeCodeMirror, { timeout: 100 });
-      } else {
-        setTimeout(initializeCodeMirror, 0);
-      }
-    </script>
+    <script src="./bootstrap.js"></script>
   </body>
 </html>
