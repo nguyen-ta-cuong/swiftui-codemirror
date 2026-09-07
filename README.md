@@ -43,7 +43,7 @@ Inline and detached editors share their owning document session and `UndoManager
 
 ## Local bundle development
 
-The JavaScript source and lockfile live in `codemirrorjs`.
+The JavaScript source and lockfile live in `codemirrorjs`. Rebuilding the bundle requires Node.js 20 or newer; use `npm ci` to install the locked dependencies.
 
 ```sh
 cd codemirrorjs

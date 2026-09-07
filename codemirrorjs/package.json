@@ -1,6 +1,9 @@
 {
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "rollup -c",
     "generate-notices": "node generate-notices.mjs",
@@ -20,7 +23,7 @@
     "@codemirror/view": "^6.36.5",
     "@rollup/plugin-commonjs": "^28.0.2",
     "@rollup/plugin-node-resolve": "^15.0.2",
-    "@rollup/plugin-terser": "^0.4.0",
+    "@rollup/plugin-terser": "1.0.0",
     "cm6-graphql": "0.2.2",
     "rollup": "^4.0.0"
   }
