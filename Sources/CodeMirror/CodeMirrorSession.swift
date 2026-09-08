@@ -395,7 +395,14 @@ extension CodeMirrorHostCommand {
 }
 
 private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [String: Any] {
-  [
+  let appearance: [String: Any] = [
+    "colorScheme": configuration.appearance.colorScheme.rawValue,
+    "increaseContrast": configuration.appearance.increaseContrast,
+    "reduceMotion": configuration.appearance.reduceMotion,
+    "reduceTransparency": configuration.appearance.reduceTransparency,
+    "theme": configuration.appearance.theme.map(themePayload) ?? NSNull(),
+  ]
+  return [
     "language": configuration.language.rawValue,
     "isReadOnly": configuration.isReadOnly,
     "wrapsLines": configuration.wrapsLines,
@@ -403,12 +410,28 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     "commandTimeoutMilliseconds": configuration.commandTimeoutMilliseconds,
     "maximumPendingTransactions": configuration.maximumPendingTransactions,
     "editorName": configuration.editorName ?? "",
-    "appearance": [
-      "colorScheme": configuration.appearance.colorScheme.rawValue,
-      "increaseContrast": configuration.appearance.increaseContrast,
-      "reduceMotion": configuration.appearance.reduceMotion,
-      "reduceTransparency": configuration.appearance.reduceTransparency,
-    ],
+    "appearance": appearance,
+  ]
+}
+
+private func themePayload(_ theme: CodeMirrorTheme) -> [String: Any] {
+  [
+    "background": rgbaPayload(theme.background),
+    "foreground": rgbaPayload(theme.foreground),
+    "gutterBackground": rgbaPayload(theme.gutterBackground),
+    "gutterForeground": rgbaPayload(theme.gutterForeground),
+    "border": rgbaPayload(theme.border),
+    "caret": rgbaPayload(theme.caret),
+    "activeLineFill": rgbaPayload(theme.activeLineFill),
+  ]
+}
+
+private func rgbaPayload(_ color: CodeMirrorRGBA) -> [String: Any] {
+  [
+    "red": NSNumber(value: color.red),
+    "green": NSNumber(value: color.green),
+    "blue": NSNumber(value: color.blue),
+    "alpha": NSNumber(value: color.alpha),
   ]
 }
 

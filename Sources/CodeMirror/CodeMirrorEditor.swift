@@ -12,7 +12,8 @@ internal func resolvedCodeMirrorAppearance(
   environmentScheme: CodeMirrorColorScheme,
   systemIncreaseContrast: Bool,
   accessibilityReduceMotion: Bool,
-  accessibilityReduceTransparency: Bool
+  accessibilityReduceTransparency: Bool,
+  theme: CodeMirrorTheme? = nil
 ) -> CodeMirrorAppearance {
   let configuredAppearance = configuration.appearance
   return CodeMirrorAppearance(
@@ -21,7 +22,8 @@ internal func resolvedCodeMirrorAppearance(
     increaseContrast: configuredAppearance.increaseContrast || systemIncreaseContrast,
     reduceMotion: configuredAppearance.reduceMotion || accessibilityReduceMotion,
     reduceTransparency: configuredAppearance.reduceTransparency
-      || accessibilityReduceTransparency
+      || accessibilityReduceTransparency,
+    theme: theme ?? configuredAppearance.theme
   )
 }
 
@@ -37,15 +39,20 @@ internal func resolvedCodeMirrorAppearance(
 
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
+    public let theme: CodeMirrorTheme?
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @Environment(\.accessibilityReduceTransparency) private var accessibilityReduceTransparency
 
-    public init(session: CodeMirrorSession, replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID())
-    {
+    public init(
+      session: CodeMirrorSession,
+      replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
+      theme: CodeMirrorTheme? = nil
+    ) {
       self.session = session
       self.replicaID = replicaID
+      self.theme = theme
     }
 
     public func makeCoordinator() -> AnyObject {
@@ -78,7 +85,8 @@ internal func resolvedCodeMirrorAppearance(
         environmentScheme: colorScheme == .dark ? .dark : .light,
         systemIncreaseContrast: systemIncreaseContrast,
         accessibilityReduceMotion: accessibilityReduceMotion,
-        accessibilityReduceTransparency: accessibilityReduceTransparency
+        accessibilityReduceTransparency: accessibilityReduceTransparency,
+        theme: theme
       )
     }
 
@@ -112,15 +120,20 @@ internal func resolvedCodeMirrorAppearance(
 
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
+    public let theme: CodeMirrorTheme?
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @Environment(\.accessibilityReduceTransparency) private var accessibilityReduceTransparency
 
-    public init(session: CodeMirrorSession, replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID())
-    {
+    public init(
+      session: CodeMirrorSession,
+      replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
+      theme: CodeMirrorTheme? = nil
+    ) {
       self.session = session
       self.replicaID = replicaID
+      self.theme = theme
     }
 
     public func makeCoordinator() -> AnyObject {
@@ -153,7 +166,8 @@ internal func resolvedCodeMirrorAppearance(
         environmentScheme: colorScheme == .dark ? .dark : .light,
         systemIncreaseContrast: systemIncreaseContrast,
         accessibilityReduceMotion: accessibilityReduceMotion,
-        accessibilityReduceTransparency: accessibilityReduceTransparency
+        accessibilityReduceTransparency: accessibilityReduceTransparency,
+        theme: theme
       )
     }
 

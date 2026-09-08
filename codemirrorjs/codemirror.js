@@ -394,7 +394,83 @@ export function formatJSON(value) {
   return { available: true, text: lines.join("\n"), diagnostic: null };
 }
 
-function lightTheme(increaseContrast) {
+function rgbaColor(color) {
+  return `rgb(${color.red * 100}% ${color.green * 100}% ${color.blue * 100}% / ${color.alpha})`;
+}
+
+function validRGBA(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const components = [value.red, value.green, value.blue, value.alpha];
+  if (!components.every(component => Number.isFinite(component) && component >= 0 && component <= 1)) {
+    return null;
+  }
+  return {
+    red: value.red,
+    green: value.green,
+    blue: value.blue,
+    alpha: value.alpha
+  };
+}
+
+function validTheme(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "object") {
+    return null;
+  }
+  const theme = {
+    background: validRGBA(value.background),
+    foreground: validRGBA(value.foreground),
+    gutterBackground: validRGBA(value.gutterBackground),
+    gutterForeground: validRGBA(value.gutterForeground),
+    border: validRGBA(value.border),
+    caret: validRGBA(value.caret),
+    activeLineFill: validRGBA(value.activeLineFill)
+  };
+  return Object.values(theme).every(Boolean) ? theme : null;
+}
+
+function customTheme(colorScheme, theme) {
+  const background = rgbaColor(theme.background);
+  const foreground = rgbaColor(theme.foreground);
+  const gutterBackground = rgbaColor(theme.gutterBackground);
+  const gutterForeground = rgbaColor(theme.gutterForeground);
+  const border = rgbaColor(theme.border);
+  const caret = rgbaColor(theme.caret);
+  const activeLineFill = rgbaColor(theme.activeLineFill);
+  return EditorView.theme({
+    "&": {
+      colorScheme,
+      backgroundColor: background,
+      color: foreground,
+      border: `1px solid ${border}`
+    },
+    ".cm-content": {
+      color: foreground,
+      caretColor: caret
+    },
+    ".cm-cursor, .cm-dropCursor": {
+      borderLeftColor: caret
+    },
+    ".cm-gutters": {
+      backgroundColor: gutterBackground,
+      color: gutterForeground,
+      border: "none",
+      borderRight: `1px solid ${border}`
+    },
+    ".cm-activeLine, .cm-activeLineGutter": {
+      backgroundColor: activeLineFill
+    }
+  });
+}
+
+function lightTheme(increaseContrast, theme = null) {
+  if (theme) {
+    return customTheme("light", theme);
+  }
   const foreground = increaseContrast ? "#111111" : "#24292f";
   const background = increaseContrast ? "#ffffff" : "#fbfbfc";
   return EditorView.theme({
@@ -406,7 +482,10 @@ function lightTheme(increaseContrast) {
   });
 }
 
-function darkTheme(increaseContrast) {
+function darkTheme(increaseContrast, theme = null) {
+  if (theme) {
+    return [customTheme("dark", theme), oneDark];
+  }
   return [oneDark, EditorView.theme({
     "&": { colorScheme: "dark", backgroundColor: increaseContrast ? "#111111" : "#1e1e1e" },
     ".cm-content": { caretColor: increaseContrast ? "#ffffff" : "#d4d4d4" }
@@ -491,7 +570,7 @@ class EditorController {
       wrapsLines: false,
       showsLineNumbers: true,
       maximumPendingTransactions: 64,
-      appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false },
+      appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null },
       editorName: "Code editor"
     };
     this.hostText = "";
@@ -687,15 +766,25 @@ class EditorController {
     if (!configuration) {
       return;
     }
-    this.configuration = { ...this.configuration, ...configuration };
+    this.configuration = {
+      ...this.configuration,
+      ...configuration,
+      appearance: {
+        ...this.configuration.appearance,
+        ...(configuration.appearance || {})
+      }
+    };
+    this.configuration.appearance.theme = validTheme(this.configuration.appearance.theme);
     if (!this.view) {
       return;
     }
     const text = this.view.state.doc.toString();
+    const appearance = this.configuration.appearance;
+    const theme = validTheme(appearance.theme);
     this.view.dispatch({
       effects: [
         this.languageCompartment.reconfigure(languageExtension(this.configuration.language, text)),
-        this.appearanceCompartment.reconfigure(this.configuration.appearance.colorScheme === "dark" ? darkTheme(this.configuration.appearance.increaseContrast) : lightTheme(this.configuration.appearance.increaseContrast)),
+        this.appearanceCompartment.reconfigure(appearance.colorScheme === "dark" ? darkTheme(appearance.increaseContrast, theme) : lightTheme(appearance.increaseContrast, theme)),
         this.lineNumberCompartment.reconfigure(this.configuration.showsLineNumbers ? lineNumbers() : []),
         this.readOnlyCompartment.reconfigure(this.initializing || this.configuration.isReadOnly ? EditorState.readOnly.of(true) : []),
         this.lineWrappingCompartment.reconfigure(this.configuration.wrapsLines ? EditorView.lineWrapping : []),
@@ -718,7 +807,11 @@ class EditorController {
     this.view.dom.setAttribute("aria-readonly", (this.initializing || this.configuration.isReadOnly) ? "true" : "false");
     this.view.dom.style.setProperty("font-family", "ui-monospace, SFMono-Regular, Menlo, monospace");
     this.view.dom.style.setProperty("transition", this.configuration.appearance.reduceMotion ? "none" : "opacity 120ms ease");
-    this.view.dom.style.setProperty("background", this.configuration.appearance.reduceTransparency ? "Canvas" : "transparent");
+    if (theme) {
+      this.view.dom.style.removeProperty?.("background");
+    } else {
+      this.view.dom.style.setProperty("background", appearance.reduceTransparency ? "Canvas" : "transparent");
+    }
     this.scheduleDiagnostics();
     this.scheduleCommandContextReport();
   }

@@ -19,6 +19,7 @@ function makeController(initialText = "", Controller = EditorController) {
   const handlers = new Map();
   const documentHandlers = new Map();
   const findInputNotifications = [];
+  const styles = new Map();
   const findInput = {
     value: "",
     selectionStart: 0,
@@ -53,7 +54,10 @@ function makeController(initialText = "", Controller = EditorController) {
     addEventListener(name, handler) { handlers.set(name, handler); },
     removeEventListener(name) { handlers.delete(name); },
     setAttribute() {},
-    style: { setProperty() {} }
+    style: {
+      setProperty(name, value) { styles.set(name, value); },
+      removeProperty(name) { styles.delete(name); }
+    }
   };
   controller.view = {
     get state() { return state; },
@@ -85,7 +89,21 @@ function makeController(initialText = "", Controller = EditorController) {
     findInputNotifications,
     handlers,
     messages,
+    styles,
     get text() { return state.doc.toString(); }
+  };
+}
+
+function makeTheme() {
+  const color = (red, green, blue, alpha = 1) => ({ red, green, blue, alpha });
+  return {
+    background: color(0.08, 0.09, 0.1),
+    foreground: color(0.9, 0.91, 0.92),
+    gutterBackground: color(0.06, 0.07, 0.08),
+    gutterForeground: color(0.55, 0.57, 0.6, 0.95),
+    border: color(0.25, 0.27, 0.3, 0.8),
+    caret: color(0.98, 0.8, 0.3),
+    activeLineFill: color(0.2, 0.22, 0.25, 0.65)
   };
 }
 
@@ -236,6 +254,59 @@ test("the packaged page is local-only and exposes the built host transport", asy
   assert.match(bundle, /fully editable/);
   assert.match(bundle, /focusTraversal/);
   assert.match(bundle, /Ctrl-Tab/);
+});
+
+test("custom dark theme wins over oneDark and colors the drawn cursors", async () => {
+  const source = await readFile(new URL("../codemirror.js", import.meta.url), "utf8");
+  assert.match(source, /return \[customTheme\("dark", theme\), oneDark\]/);
+  assert.match(source, /"\.cm-cursor, \.cm-dropCursor": \{\s*borderLeftColor: caret\s*\}/);
+});
+
+test("custom theme reconfiguration preserves editor state and removes inline background override", () => {
+  const harness = makeController("source");
+  const { controller, documentRef, findInput, styles } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.hostRevision = 7;
+  controller.localRevision = 7;
+  controller.configuration = {
+    ...controller.configuration,
+    appearance: { ...controller.configuration.appearance, colorScheme: "dark", theme: null }
+  };
+  controller.view.state = EditorState.create({
+    doc: "source",
+    selection: { anchor: 1, head: 4 }
+  });
+  controller.updateConfiguration({ appearance: { theme: makeTheme() } });
+
+  assert.equal(harness.text, "source");
+  assert.deepEqual(controller.view.state.selection.ranges.map(range => [range.from, range.to]), [[1, 4]]);
+  assert.equal(controller.hostRevision, 7);
+  assert.equal(controller.localRevision, 7);
+  assert.deepEqual(controller.configuration.appearance.theme, makeTheme());
+  assert.equal(styles.has("background"), false);
+
+  documentRef.activeElement = findInput;
+  controller.resetFindHistory(findInput, controller.findSnapshot(findInput));
+  const findContextID = controller.findContextID;
+  const findHistory = controller.findHistory;
+  controller.updateConfiguration({ appearance: { theme: null } });
+  assert.equal(controller.findContextID, findContextID);
+  assert.equal(controller.findHistory, findHistory);
+  assert.equal(styles.get("background"), "transparent");
+  controller.destroy();
+});
+
+test("malformed custom theme values are rejected without entering the appearance state", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  const theme = makeTheme();
+  theme.border.red = 2;
+  controller.updateConfiguration({ appearance: { theme } });
+  assert.equal(controller.configuration.appearance.theme, null);
+  controller.destroy();
 });
 
 test("runtime notices retain installed permission text and classify non-bundled locks", async () => {

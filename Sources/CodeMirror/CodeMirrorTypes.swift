@@ -43,22 +43,107 @@ public enum CodeMirrorColorScheme: String, Hashable, Sendable, Codable {
   case dark
 }
 
+public struct CodeMirrorRGBA: Equatable, Hashable, Sendable, Codable {
+  public let red: Double
+  public let green: Double
+  public let blue: Double
+  public let alpha: Double
+
+  public init?(red: Double, green: Double, blue: Double, alpha: Double = 1) {
+    guard Self.isValidComponent(red), Self.isValidComponent(green),
+      Self.isValidComponent(blue), Self.isValidComponent(alpha)
+    else {
+      return nil
+    }
+    self.red = red
+    self.green = green
+    self.blue = blue
+    self.alpha = alpha
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case red
+    case green
+    case blue
+    case alpha
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let red = try container.decode(Double.self, forKey: .red)
+    let green = try container.decode(Double.self, forKey: .green)
+    let blue = try container.decode(Double.self, forKey: .blue)
+    let alpha = try container.decode(Double.self, forKey: .alpha)
+    guard let value = Self(red: red, green: green, blue: blue, alpha: alpha) else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .red,
+        in: container,
+        debugDescription: "CodeMirrorRGBA components must be finite values between 0 and 1."
+      )
+    }
+    self = value
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(red, forKey: .red)
+    try container.encode(green, forKey: .green)
+    try container.encode(blue, forKey: .blue)
+    try container.encode(alpha, forKey: .alpha)
+  }
+
+  private static func isValidComponent(_ value: Double) -> Bool {
+    value.isFinite && (0...1).contains(value)
+  }
+}
+
+public struct CodeMirrorTheme: Equatable, Hashable, Sendable, Codable {
+  public let background: CodeMirrorRGBA
+  public let foreground: CodeMirrorRGBA
+  public let gutterBackground: CodeMirrorRGBA
+  public let gutterForeground: CodeMirrorRGBA
+  public let border: CodeMirrorRGBA
+  public let caret: CodeMirrorRGBA
+  public let activeLineFill: CodeMirrorRGBA
+
+  public init(
+    background: CodeMirrorRGBA,
+    foreground: CodeMirrorRGBA,
+    gutterBackground: CodeMirrorRGBA,
+    gutterForeground: CodeMirrorRGBA,
+    border: CodeMirrorRGBA,
+    caret: CodeMirrorRGBA,
+    activeLineFill: CodeMirrorRGBA
+  ) {
+    self.background = background
+    self.foreground = foreground
+    self.gutterBackground = gutterBackground
+    self.gutterForeground = gutterForeground
+    self.border = border
+    self.caret = caret
+    self.activeLineFill = activeLineFill
+  }
+}
+
 public struct CodeMirrorAppearance: Equatable, Sendable, Codable {
   public var colorScheme: CodeMirrorColorScheme
   public var increaseContrast: Bool
   public var reduceMotion: Bool
   public var reduceTransparency: Bool
+  public var theme: CodeMirrorTheme?
 
   public init(
     colorScheme: CodeMirrorColorScheme = .system,
     increaseContrast: Bool = false,
     reduceMotion: Bool = false,
-    reduceTransparency: Bool = false
+    reduceTransparency: Bool = false,
+    theme: CodeMirrorTheme? = nil
   ) {
     self.colorScheme = colorScheme
     self.increaseContrast = increaseContrast
     self.reduceMotion = reduceMotion
     self.reduceTransparency = reduceTransparency
+    self.theme = theme
   }
 }
 

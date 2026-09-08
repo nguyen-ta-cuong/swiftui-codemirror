@@ -68,6 +68,24 @@ let session = CodeMirrorSession(
 CodeMirrorEditor(session: session)
 ```
 
+For a per-editor presentation palette, pass a validated `CodeMirrorTheme` to the editor. Its seven `CodeMirrorRGBA` fields use finite components in the inclusive 0...1 range and are carried per replica, so changing a theme does not change the session text, revision, selections, or history.
+
+```swift
+let theme = CodeMirrorTheme(
+    background: CodeMirrorRGBA(red: 0.08, green: 0.09, blue: 0.1)!,
+    foreground: CodeMirrorRGBA(red: 0.9, green: 0.91, blue: 0.92)!,
+    gutterBackground: CodeMirrorRGBA(red: 0.06, green: 0.07, blue: 0.08)!,
+    gutterForeground: CodeMirrorRGBA(red: 0.55, green: 0.57, blue: 0.6, alpha: 0.95)!,
+    border: CodeMirrorRGBA(red: 0.25, green: 0.27, blue: 0.3, alpha: 0.8)!,
+    caret: CodeMirrorRGBA(red: 0.98, green: 0.8, blue: 0.3)!,
+    activeLineFill: CodeMirrorRGBA(red: 0.2, green: 0.22, blue: 0.25, alpha: 0.65)!
+)
+
+CodeMirrorEditor(session: session, theme: theme)
+```
+
+Pass `nil` to retain the existing light, dark, or high-contrast renderer. The theme is presentation state and is never persisted in a document.
+
 `CodeMirrorSession` is main-actor owned. Its event callback is synchronous so a host reducer can accept a transaction, replace it with authoritative text, or invalidate the session before the WebKit replica receives an acknowledgement. `CodeMirrorChange` ranges and selections use UTF-16 offsets; inbound changes must carry the source preimage, which the session validates and normalizes before acceptance.
 
 Use `flush()` before saving, exporting, running, navigating, or tearing down an editor. Use `replace` for host-owned undo and redo; those replacements update replicas without generating editor events or WebKit history entries. When a reducer must apply an undo or redo replacement synchronously, `replaceImmediately(expectedRevision:changes:selection:in:)` performs the same atomic validation and replica update without an async suspension. `focusedReplicaID()` checks the current native key-window responder synchronously and returns no replica for an unmounted, hidden, inactive, invalidated, or native-form-focused view.

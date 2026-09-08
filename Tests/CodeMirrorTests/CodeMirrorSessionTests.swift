@@ -40,6 +40,18 @@ private func sendCommandContext(
     ))
 }
 
+private func makeTestTheme() -> CodeMirrorTheme {
+  CodeMirrorTheme(
+    background: CodeMirrorRGBA(red: 0.08, green: 0.09, blue: 0.1, alpha: 1)!,
+    foreground: CodeMirrorRGBA(red: 0.9, green: 0.91, blue: 0.92, alpha: 1)!,
+    gutterBackground: CodeMirrorRGBA(red: 0.06, green: 0.07, blue: 0.08, alpha: 1)!,
+    gutterForeground: CodeMirrorRGBA(red: 0.55, green: 0.57, blue: 0.6, alpha: 0.95)!,
+    border: CodeMirrorRGBA(red: 0.25, green: 0.27, blue: 0.3, alpha: 0.8)!,
+    caret: CodeMirrorRGBA(red: 0.98, green: 0.8, blue: 0.3, alpha: 1)!,
+    activeLineFill: CodeMirrorRGBA(red: 0.2, green: 0.22, blue: 0.25, alpha: 0.65)!
+  )
+}
+
 @MainActor
 private func routeRequestID(
   in commands: [CodeMirrorHostCommand], command expected: CodeMirrorCommand
@@ -612,6 +624,62 @@ final class CodeMirrorSessionTests: XCTestCase {
     }
     XCTAssertEqual(configurations.map(\.appearance), [dark, light])
     XCTAssertEqual(session.configuration.appearance.colorScheme, .system)
+    session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
+  func testRGBAValidatesNormalizedFiniteComponentsAndRejectsInvalidDecode() throws {
+    let color = try XCTUnwrap(
+      CodeMirrorRGBA(red: 0.1, green: 0.2, blue: 0.3, alpha: 0.4))
+    XCTAssertEqual(color.red, 0.1)
+    XCTAssertEqual(color.green, 0.2)
+    XCTAssertEqual(color.blue, 0.3)
+    XCTAssertEqual(color.alpha, 0.4)
+
+    for component in [Double.nan, Double.infinity, -Double.infinity, -0.01, 1.01] {
+      XCTAssertNil(CodeMirrorRGBA(red: component, green: 0.2, blue: 0.3))
+      XCTAssertNil(CodeMirrorRGBA(red: 0.1, green: component, blue: 0.3))
+      XCTAssertNil(CodeMirrorRGBA(red: 0.1, green: 0.2, blue: component))
+      XCTAssertNil(CodeMirrorRGBA(red: 0.1, green: 0.2, blue: 0.3, alpha: component))
+    }
+
+    let encoded = try JSONEncoder().encode(color)
+    XCTAssertEqual(try JSONDecoder().decode(CodeMirrorRGBA.self, from: encoded), color)
+    let invalid = Data(#"{"red":1.1,"green":0.2,"blue":0.3,"alpha":1}"#.utf8)
+    XCTAssertThrowsError(try JSONDecoder().decode(CodeMirrorRGBA.self, from: invalid))
+  }
+
+  func testThemeAndAppearanceCodableRoundTrip() throws {
+    let theme = makeTestTheme()
+    let appearance = CodeMirrorAppearance(colorScheme: .dark, theme: theme)
+    let encoded = try JSONEncoder().encode(appearance)
+    XCTAssertEqual(try JSONDecoder().decode(CodeMirrorAppearance.self, from: encoded), appearance)
+  }
+
+  func testReplicaThemeUsesNumericPayloadWithoutMutatingSharedConfiguration() throws {
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    let theme = makeTestTheme()
+    let appearance = CodeMirrorAppearance(colorScheme: .dark, theme: theme)
+
+    session.update(appearance: appearance, for: replicaID)
+
+    guard let command = commands.last,
+      case .updateConfiguration(let configuration) = command
+    else {
+      return XCTFail("theme update did not produce a configuration command")
+    }
+    XCTAssertEqual(configuration.appearance.theme, theme)
+    XCTAssertNil(session.configuration.appearance.theme)
+    let payload = command.payload
+    let configurationPayload = try XCTUnwrap(payload["configuration"] as? [String: Any])
+    let appearancePayload = try XCTUnwrap(configurationPayload["appearance"] as? [String: Any])
+    let themePayload = try XCTUnwrap(appearancePayload["theme"] as? [String: Any])
+    let backgroundPayload = try XCTUnwrap(themePayload["background"] as? [String: Any])
+    XCTAssertEqual((backgroundPayload["red"] as? NSNumber)?.doubleValue, theme.background.red)
+    XCTAssertEqual((backgroundPayload["alpha"] as? NSNumber)?.doubleValue, theme.background.alpha)
     session.detach(replicaID: replicaID, loadID: loadID)
   }
 
