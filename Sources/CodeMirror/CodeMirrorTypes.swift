@@ -37,6 +37,11 @@ public enum CodeMirrorLanguage: String, CaseIterable, Hashable, Sendable, Codabl
   case graphql
 }
 
+public enum CodeMirrorJSONKeyOrder: String, Hashable, Sendable, Codable {
+  case preserve
+  case sorted
+}
+
 public enum CodeMirrorColorScheme: String, Hashable, Sendable, Codable {
   case system
   case light
@@ -157,6 +162,41 @@ public struct CodeMirrorDiagnosticPresentationPolicy: Equatable, Sendable, Codab
   }
 }
 
+public enum CodeMirrorEditorHeightPolicy: Equatable, Hashable, Sendable {
+  case contentSized(minimumVisibleRows: Int, maximumVisibleRows: Int)
+  case fillsAvailableScrollViewport(minimumVisibleRows: Int)
+
+  internal var normalized: Self {
+    switch self {
+    case .contentSized(let minimumVisibleRows, let maximumVisibleRows)
+    where minimumVisibleRows >= 0 && maximumVisibleRows >= minimumVisibleRows:
+      self
+    case .contentSized:
+      .fillsAvailableScrollViewport(minimumVisibleRows: 0)
+    case .fillsAvailableScrollViewport(let minimumVisibleRows) where minimumVisibleRows >= 0:
+      self
+    case .fillsAvailableScrollViewport:
+      .fillsAvailableScrollViewport(minimumVisibleRows: 0)
+    }
+  }
+
+  internal var payload: [String: Any] {
+    switch normalized {
+    case .contentSized(let minimumVisibleRows, let maximumVisibleRows):
+      return [
+        "mode": "contentSized",
+        "minimumVisibleRows": minimumVisibleRows,
+        "maximumVisibleRows": maximumVisibleRows
+      ]
+    case .fillsAvailableScrollViewport(let minimumVisibleRows):
+      return [
+        "mode": "fillsAvailableScrollViewport",
+        "minimumVisibleRows": minimumVisibleRows
+      ]
+    }
+  }
+}
+
 public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
   public var language: CodeMirrorLanguage
   public var isReadOnly: Bool
@@ -167,6 +207,7 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
   public var appearance: CodeMirrorAppearance
   public var editorName: String?
   public var diagnosticPresentationPolicy: CodeMirrorDiagnosticPresentationPolicy?
+  public var jsonKeyOrder: CodeMirrorJSONKeyOrder?
 
   public init(
     language: CodeMirrorLanguage = .text,
@@ -177,7 +218,8 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     maximumPendingTransactions: Int = 64,
     appearance: CodeMirrorAppearance = CodeMirrorAppearance(),
     editorName: String? = nil,
-    diagnosticPresentationPolicy: CodeMirrorDiagnosticPresentationPolicy? = nil
+    diagnosticPresentationPolicy: CodeMirrorDiagnosticPresentationPolicy? = nil,
+    jsonKeyOrder: CodeMirrorJSONKeyOrder? = nil
   ) {
     self.language = language
     self.isReadOnly = isReadOnly
@@ -188,6 +230,7 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     self.appearance = appearance
     self.editorName = editorName
     self.diagnosticPresentationPolicy = diagnosticPresentationPolicy
+    self.jsonKeyOrder = jsonKeyOrder
   }
 
   internal var normalized: CodeMirrorConfiguration {

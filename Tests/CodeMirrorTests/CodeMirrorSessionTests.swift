@@ -673,6 +673,20 @@ final class CodeMirrorSessionTests: XCTestCase {
         .diagnosticPresentationPolicy)
   }
 
+  func testJSONKeyOrderRoundTripsAndDefaultsWhenOmitted() throws {
+    let configuration = CodeMirrorConfiguration(language: .json, jsonKeyOrder: .sorted)
+    let encoded = try JSONEncoder().encode(configuration)
+    XCTAssertEqual(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: encoded), configuration)
+
+    var legacyObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    legacyObject.removeValue(forKey: "jsonKeyOrder")
+    let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+    XCTAssertNil(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: legacyData).jsonKeyOrder)
+  }
+
   func testDiagnosticPresentationPolicyBroadcastPreservesReplicaIdentityAndRevision() throws {
     let initialPolicy = CodeMirrorDiagnosticPresentationPolicy(
       allowsEmpty: true, consequence: "Response text is saved.")
@@ -756,6 +770,43 @@ final class CodeMirrorSessionTests: XCTestCase {
       XCTAssertEqual(policyPayload["allowsEmpty"] as? Bool, false)
       XCTAssertEqual(policyPayload["consequence"] as? String, updatedPolicy.consequence)
     }
+  }
+
+  func testJSONKeyOrderBroadcastPreservesReplicaIdentityAndRevision() throws {
+    let session = CodeMirrorSession(
+      initialText: "source",
+      configuration: CodeMirrorConfiguration(language: .json, jsonKeyOrder: .sorted)
+    ) { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+
+    guard
+      case .configure(let configuration, let snapshot, let commandReplicaID, let commandLoadID) =
+        commands.first
+    else {
+      return XCTFail("replica did not receive initial configuration")
+    }
+    XCTAssertEqual(configuration.jsonKeyOrder, .sorted)
+    XCTAssertEqual(snapshot.revision, .zero)
+    XCTAssertEqual(commandReplicaID, replicaID)
+    XCTAssertEqual(commandLoadID, loadID)
+    let initialPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertEqual(initialPayload["jsonKeyOrder"] as? String, "sorted")
+
+    let before = try session.snapshot()
+    commands.removeAll()
+    session.update(
+      configuration: CodeMirrorConfiguration(language: .json, jsonKeyOrder: nil))
+    XCTAssertEqual(try session.snapshot(), before)
+    guard case .updateConfiguration(let updatedConfiguration) = commands.first else {
+      return XCTFail("replica did not receive key-order reset")
+    }
+    XCTAssertNil(updatedConfiguration.jsonKeyOrder)
+    let updatedPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertNil(updatedPayload["jsonKeyOrder"])
   }
 
   func testReplicaThemeUsesNumericPayloadWithoutMutatingSharedConfiguration() throws {

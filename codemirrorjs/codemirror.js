@@ -13,6 +13,7 @@ export const MAX_ANALYSIS_BYTES = 1024 * 1024;
 const MAX_FIND_HISTORY_SNAPSHOTS = 32;
 const MAX_FIND_HISTORY_UNITS = 1024 * 1024;
 const MAX_PENDING_FLUSH_REQUESTS = 32;
+const MAX_REPORTED_HEIGHT = 4096;
 
 export function utf8ByteLength(value) {
   return new TextEncoder().encode(value).byteLength;
@@ -255,6 +256,88 @@ function presentedDiagnostics(language, value, configuration) {
     : diagnostic);
 }
 
+function normalizedHeightPolicy(value) {
+  if (value?.mode === "contentSized"
+    && Number.isInteger(value.minimumVisibleRows)
+    && Number.isInteger(value.maximumVisibleRows)
+    && value.minimumVisibleRows >= 0
+    && value.maximumVisibleRows >= value.minimumVisibleRows) {
+    return {
+      mode: "contentSized",
+      minimumVisibleRows: value.minimumVisibleRows,
+      maximumVisibleRows: value.maximumVisibleRows
+    };
+  }
+  if (value?.mode === "fillsAvailableScrollViewport") {
+    const minimumVisibleRows = Number(value.minimumVisibleRows);
+    return {
+      mode: "fillsAvailableScrollViewport",
+      minimumVisibleRows: Number.isFinite(minimumVisibleRows)
+        ? Math.max(0, Math.floor(minimumVisibleRows))
+        : 0
+    };
+  }
+  return { mode: "fillsAvailableScrollViewport", minimumVisibleRows: 0 };
+}
+
+function isValidMeasurementID(value) {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function styleValue(style, property) {
+  if (typeof style.getPropertyValue === "function") {
+    return style.getPropertyValue(property);
+  }
+  return style[property] || "";
+}
+
+function setStyleValue(style, property, value) {
+  if (typeof style.setProperty === "function") {
+    style.setProperty(property, value);
+  } else {
+    style[property] = value;
+  }
+}
+
+function restoreStyleValue(style, property, value) {
+  if (value) {
+    setStyleValue(style, property, value);
+  } else if (typeof style.removeProperty === "function") {
+    style.removeProperty(property);
+  } else {
+    style[property] = "";
+  }
+}
+
+function withNaturalEditorHeight(editor, scrollDOM, measure) {
+  const temporary = [
+    [editor, "flex", "none"],
+    [editor, "height", "auto"],
+    [editor, "min-height", "0"],
+    [editor, "max-height", "none"],
+    [scrollDOM, "height", "auto"],
+    [scrollDOM, "min-height", "0"],
+    [scrollDOM, "max-height", "none"],
+    [scrollDOM, "overflow-y", "visible"]
+  ];
+  const previous = [];
+  for (const [element, property, value] of temporary) {
+    if (!element?.style) {
+      continue;
+    }
+    previous.push({ element, property, value: styleValue(element.style, property) });
+    setStyleValue(element.style, property, value);
+  }
+  try {
+    return measure();
+  } finally {
+    for (const entry of previous.reverse()) {
+      restoreStyleValue(entry.element.style, entry.property, entry.value);
+    }
+  }
+}
+
 export function jsonLiteralCompletion(context) {
   const word = context.matchBefore(/[A-Za-z]*/);
   if (!context.explicit && (!word || word.from === word.to)) {
@@ -359,7 +442,185 @@ function tokenizeJSON(value) {
   return tokens;
 }
 
-export function formatJSON(value) {
+function compareJSONKeys(left, right) {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftCode = left.charCodeAt(index);
+    const rightCode = right.charCodeAt(index);
+    if (leftCode !== rightCode) {
+      return leftCode - rightCode;
+    }
+  }
+  return left.length - right.length;
+}
+
+function parseJSONTokens(tokens) {
+  const root = { kind: "root", state: "value", value: null };
+  const stack = [root];
+  const canAcceptValue = frame => (
+    (frame.kind === "root" && frame.state === "value")
+    || (frame.kind === "array" && frame.state === "valueOrEnd")
+    || (frame.kind === "object" && frame.state === "value")
+  );
+  const attachValue = node => {
+    const frame = stack.at(-1);
+    if (frame.kind === "root") {
+      frame.value = node;
+      frame.state = "done";
+    } else if (frame.kind === "array") {
+      frame.node.elements.push(node);
+      frame.state = "commaOrEnd";
+    } else {
+      frame.node.members.push({
+        key: frame.pendingKey,
+        keyToken: frame.pendingKeyToken,
+        value: node,
+        index: frame.node.members.length
+      });
+      frame.pendingKey = null;
+      frame.pendingKeyToken = null;
+      frame.state = "commaOrEnd";
+    }
+  };
+  const closeContainer = kind => {
+    const frame = stack.at(-1);
+    if (frame.kind !== kind || (frame.state !== "valueOrEnd" && frame.state !== "keyOrEnd"
+      && frame.state !== "commaOrEnd")) {
+      return false;
+    }
+    stack.pop();
+    attachValue(frame.node);
+    return true;
+  };
+
+  for (const token of tokens) {
+    const frame = stack.at(-1);
+    if (token.kind === "{") {
+      if (!canAcceptValue(frame)) {
+        return null;
+      }
+      stack.push({
+        kind: "object",
+        node: { kind: "object", members: [] },
+        state: "keyOrEnd",
+        pendingKey: null,
+        pendingKeyToken: null
+      });
+      continue;
+    }
+    if (token.kind === "[") {
+      if (!canAcceptValue(frame)) {
+        return null;
+      }
+      stack.push({
+        kind: "array",
+        node: { kind: "array", elements: [] },
+        state: "valueOrEnd"
+      });
+      continue;
+    }
+    if (token.kind === "}") {
+      if (!closeContainer("object")) {
+        return null;
+      }
+      continue;
+    }
+    if (token.kind === "]") {
+      if (!closeContainer("array")) {
+        return null;
+      }
+      continue;
+    }
+    if (token.kind === ",") {
+      if (frame.state !== "commaOrEnd") {
+        return null;
+      }
+      frame.state = frame.kind === "array" ? "valueOrEnd" : "keyOrEnd";
+      continue;
+    }
+    if (token.kind === ":") {
+      if (frame.kind !== "object" || frame.state !== "colon") {
+        return null;
+      }
+      frame.state = "value";
+      continue;
+    }
+    if (frame.kind === "object" && frame.state === "keyOrEnd") {
+      let key;
+      try {
+        key = JSON.parse(token.value);
+      } catch {
+        return null;
+      }
+      if (typeof key !== "string") {
+        return null;
+      }
+      frame.pendingKey = key;
+      frame.pendingKeyToken = token;
+      frame.state = "colon";
+      continue;
+    }
+    if (!canAcceptValue(frame)) {
+      return null;
+    }
+    attachValue({ kind: "value", token });
+  }
+  if (stack.length !== 1 || root.state !== "done") {
+    return null;
+  }
+  return root.value;
+}
+
+function orderedJSONTokens(tokens) {
+  const root = parseJSONTokens(tokens);
+  if (!root) {
+    return tokens;
+  }
+  const result = [];
+  const work = [{ kind: "node", node: root }];
+  const pushToken = value => work.push({ kind: "token", token: { kind: value, value } });
+  while (work.length > 0) {
+    const operation = work.pop();
+    if (operation.kind === "token") {
+      result.push(operation.token);
+      continue;
+    }
+    const node = operation.node;
+    if (node.kind === "value") {
+      result.push(node.token);
+      continue;
+    }
+    if (node.kind === "array") {
+      pushToken("]");
+      for (let index = node.elements.length - 1; index >= 0; index -= 1) {
+        work.push({ kind: "node", node: node.elements[index] });
+        if (index > 0) {
+          pushToken(",");
+        }
+      }
+      pushToken("[");
+      continue;
+    }
+    const members = node.members.sort((left, right) => {
+      const keyOrder = compareJSONKeys(left.key, right.key);
+      return keyOrder !== 0 ? keyOrder : left.index - right.index;
+    });
+    pushToken("}");
+    for (let index = members.length - 1; index >= 0; index -= 1) {
+      const member = members[index];
+      work.push({ kind: "node", node: member.value });
+      pushToken(":");
+      work.push({ kind: "token", token: member.keyToken });
+      if (index > 0) {
+        pushToken(",");
+      }
+    }
+    pushToken("{");
+  }
+  return result;
+}
+
+export function formatJSON(value, jsonKeyOrder = "preserve") {
   try {
     JSON.parse(value);
   } catch {
@@ -369,6 +630,7 @@ export function formatJSON(value) {
   if (!tokens) {
     return { available: false, text: value, diagnostic: "JSON string syntax is incomplete." };
   }
+  const orderedTokens = jsonKeyOrder === "sorted" ? orderedJSONTokens(tokens) : tokens;
   const lines = [];
   let current = "";
   let indentation = 0;
@@ -379,9 +641,9 @@ export function formatJSON(value) {
       current = "";
     }
   };
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    const next = tokens[index + 1]?.kind;
+  for (let index = 0; index < orderedTokens.length; index += 1) {
+    const token = orderedTokens[index];
+    const next = orderedTokens[index + 1]?.kind;
     if (token.kind === "{" || token.kind === "[") {
       current += token.value;
       if (next !== "}" && next !== "]") {
@@ -596,7 +858,8 @@ class EditorController {
       maximumPendingTransactions: 64,
       appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null },
       editorName: "Code editor",
-      diagnosticPresentationPolicy: null
+      diagnosticPresentationPolicy: null,
+      jsonKeyOrder: "preserve"
     };
     this.hostText = "";
     this.hostRevision = 0;
@@ -616,6 +879,13 @@ class EditorController {
     this.compositionSettlementTimer = null;
     this.diagnosticsPanel = null;
     this.diagnosticsScheduled = false;
+    this.heightPolicy = { mode: "fillsAvailableScrollViewport", minimumVisibleRows: 0 };
+    this.heightMeasurementFrame = null;
+    this.heightMeasurementGeneration = 0;
+    this.heightObserver = null;
+    this.lastObservedWidth = null;
+    this.lastReportedHeight = null;
+    this.heightMeasurementID = null;
     this.languageCompartment = new Compartment();
     this.appearanceCompartment = new Compartment();
     this.lineNumberCompartment = new Compartment();
@@ -718,10 +988,19 @@ class EditorController {
     }
     switch (command.type) {
     case "configure":
-      this.configure(command);
+      if (this.replaceHeightMeasurement(command.measurementID)) {
+        this.configure(command);
+      }
       break;
     case "updateConfiguration":
-      this.updateConfiguration(command.configuration);
+      if (this.replaceHeightMeasurement(command.measurementID)) {
+        this.updateConfiguration(command.configuration);
+      }
+      break;
+    case "setHeightPolicy":
+      if (this.replaceHeightMeasurement(command.measurementID)) {
+        this.updateHeightPolicy(command.policy);
+      }
       break;
     case "apply":
       this.applySnapshot(command, true);
@@ -762,7 +1041,19 @@ class EditorController {
     }
   }
 
+  replaceHeightMeasurement(measurementID) {
+    if (!isValidMeasurementID(measurementID)) {
+      this.post({ type: "failure", code: "transportFailure" });
+      return false;
+    }
+    this.resetHeightMeasurement();
+    this.heightMeasurementID = measurementID;
+    return true;
+  }
+
   configure(command) {
+    this.resetHeightMeasurement();
+    this.heightPolicy = { mode: "fillsAvailableScrollViewport", minimumVisibleRows: 0 };
     this.initializing = true;
     this.configured = false;
     this.sessionID = command.sessionID;
@@ -787,6 +1078,201 @@ class EditorController {
     this.scheduleCommandContextReport(true);
   }
 
+  updateHeightPolicy(value) {
+    this.resetHeightMeasurement();
+    this.heightPolicy = normalizedHeightPolicy(value);
+    if (this.configured) {
+      if (this.heightPolicy.mode === "contentSized") {
+        this.installHeightObserver();
+        this.scheduleHeightMeasurement();
+      } else if (this.heightPolicy.minimumVisibleRows > 0) {
+        this.installFillHeightObserver();
+        this.scheduleHeightMeasurement();
+      }
+    }
+  }
+
+  resetHeightMeasurement() {
+    this.cancelHeightMeasurement();
+    this.disconnectHeightObserver();
+    this.heightMeasurementGeneration += 1;
+    this.lastObservedWidth = null;
+    this.lastReportedHeight = null;
+  }
+
+  cancelHeightMeasurement() {
+    if (this.heightMeasurementFrame === null) {
+      return;
+    }
+    const cancel = this.documentRef.defaultView?.cancelAnimationFrame ?? globalThis.cancelAnimationFrame;
+    if (typeof cancel === "function") {
+      cancel(this.heightMeasurementFrame);
+    }
+    this.heightMeasurementFrame = null;
+  }
+
+  disconnectHeightObserver() {
+    this.heightObserver?.disconnect?.();
+    this.heightObserver = null;
+  }
+
+  installHeightObserver() {
+    if (this.heightObserver || !this.view?.dom) {
+      return;
+    }
+    const Observer = this.documentRef.defaultView?.ResizeObserver ?? globalThis.ResizeObserver;
+    if (typeof Observer !== "function") {
+      return;
+    }
+    this.heightObserver = new Observer(entries => {
+      const width = Number(entries?.[0]?.contentRect?.width);
+      if (!Number.isFinite(width) || width === this.lastObservedWidth) {
+        return;
+      }
+      this.lastObservedWidth = width;
+      this.scheduleHeightMeasurement();
+    });
+    this.heightObserver.observe(this.view.dom);
+  }
+
+  installFillHeightObserver() {
+    if (this.heightObserver || !this.diagnosticsPanel) {
+      return;
+    }
+    const Observer = this.documentRef.defaultView?.ResizeObserver ?? globalThis.ResizeObserver;
+    if (typeof Observer !== "function") {
+      return;
+    }
+    this.heightObserver = new Observer(entries => {
+      const width = Number(entries?.[0]?.contentRect?.width);
+      if (!Number.isFinite(width) || width === this.lastObservedWidth) {
+        return;
+      }
+      this.lastObservedWidth = width;
+      this.scheduleHeightMeasurement();
+    });
+    this.heightObserver.observe(this.diagnosticsPanel);
+  }
+
+  scheduleHeightMeasurement() {
+    const positiveFill = this.heightPolicy.mode === "fillsAvailableScrollViewport"
+      && this.heightPolicy.minimumVisibleRows > 0;
+    if (!this.configured || (!positiveFill && this.heightPolicy.mode !== "contentSized")
+      || !this.view || this.heightMeasurementFrame !== null) {
+      return;
+    }
+    const request = this.documentRef.defaultView?.requestAnimationFrame
+      ?? globalThis.requestAnimationFrame;
+    if (typeof request !== "function") {
+      return;
+    }
+    const generation = this.heightMeasurementGeneration;
+    const frame = request(() => {
+      if (generation !== this.heightMeasurementGeneration) {
+        return;
+      }
+      this.heightMeasurementFrame = null;
+      this.measureHeight();
+    });
+    this.heightMeasurementFrame = frame ?? 0;
+  }
+
+  measureHeight() {
+    if (!this.configured || !this.view) {
+      return;
+    }
+    if (!this.heightMeasurementID) {
+      return;
+    }
+    const lineHeight = Number(this.view.defaultLineHeight);
+    const paddingTop = Number(this.view.documentPadding?.top);
+    const paddingBottom = Number(this.view.documentPadding?.bottom);
+    const documentPadding = paddingTop + paddingBottom;
+    if (!Number.isFinite(lineHeight) || lineHeight <= 0
+      || !Number.isFinite(paddingTop) || paddingTop < 0
+      || !Number.isFinite(paddingBottom) || paddingBottom < 0
+      || !Number.isFinite(documentPadding) || documentPadding < 0) {
+      return;
+    }
+    let totalHeight;
+    if (this.heightPolicy.mode === "contentSized") {
+      const editor = this.view.dom;
+      const scrollDOM = this.view.scrollDOM;
+      if (!editor || !scrollDOM) {
+        return;
+      }
+      const minimumHeight = this.heightPolicy.minimumVisibleRows * lineHeight + documentPadding;
+      const maximumHeight = this.heightPolicy.maximumVisibleRows * lineHeight + documentPadding;
+      if (!Number.isFinite(minimumHeight) || !Number.isFinite(maximumHeight)
+        || minimumHeight < 0 || maximumHeight < minimumHeight) {
+        return;
+      }
+      const naturalHeight = withNaturalEditorHeight(
+        editor, scrollDOM, () => Number(scrollDOM.scrollHeight));
+      if (!Number.isFinite(naturalHeight) || naturalHeight < 0) {
+        return;
+      }
+      const editorHeight = Math.max(minimumHeight, Math.min(maximumHeight, naturalHeight));
+      totalHeight = editorHeight + this.renderedDiagnosticsHeight();
+    } else {
+      const minimumHeight = this.heightPolicy.minimumVisibleRows * lineHeight + documentPadding;
+      if (!Number.isFinite(minimumHeight) || minimumHeight < 0) {
+        return;
+      }
+      const diagnosticsHeight = this.positiveFillDiagnosticsHeight();
+      if (diagnosticsHeight === null) {
+        return;
+      }
+      totalHeight = minimumHeight + diagnosticsHeight;
+    }
+    if (!Number.isFinite(totalHeight) || totalHeight < 0 || totalHeight > MAX_REPORTED_HEIGHT) {
+      return;
+    }
+    if (totalHeight === this.lastReportedHeight) {
+      return;
+    }
+    this.lastReportedHeight = totalHeight;
+    this.post({
+      type: "contentSize",
+      measurementID: this.heightMeasurementID,
+      height: totalHeight
+    });
+  }
+
+  renderedDiagnosticsHeight() {
+    if (!this.diagnosticsPanel || this.diagnosticsPanel.hidden) {
+      return 0;
+    }
+    const rect = this.diagnosticsPanel.getBoundingClientRect?.();
+    const height = Number(rect?.height ?? this.diagnosticsPanel.offsetHeight);
+    return Number.isFinite(height) && height >= 0 ? height : 0;
+  }
+
+  positiveFillDiagnosticsHeight() {
+    if (!this.diagnosticsPanel || this.diagnosticsPanel.hidden) {
+      return 0;
+    }
+    const panel = this.diagnosticsPanel;
+    const style = this.documentRef.defaultView?.getComputedStyle?.(panel);
+    const finiteNumber = value => {
+      const result = Number.parseFloat(value);
+      return Number.isFinite(result) && result >= 0 ? result : null;
+    };
+    const naturalHeight = Number(panel.scrollHeight);
+    const borderTop = finiteNumber(style?.borderTopWidth);
+    const borderBottom = finiteNumber(style?.borderBottomWidth);
+    const maxHeight = finiteNumber(style?.maxHeight);
+    if (!Number.isFinite(naturalHeight) || naturalHeight < 0
+      || borderTop === null || borderBottom === null || maxHeight === null) {
+      return null;
+    }
+    const measuredHeight = naturalHeight + borderTop + borderBottom;
+    if (!Number.isFinite(measuredHeight) || measuredHeight < 0) {
+      return null;
+    }
+    return Math.min(measuredHeight, maxHeight);
+  }
+
   updateConfiguration(configuration) {
     if (!configuration) {
       return;
@@ -794,6 +1280,7 @@ class EditorController {
     this.configuration = {
       ...this.configuration,
       ...configuration,
+      jsonKeyOrder: configuration.jsonKeyOrder ?? "preserve",
       appearance: {
         ...this.configuration.appearance,
         ...(configuration.appearance || {})
@@ -838,6 +1325,7 @@ class EditorController {
       this.view.dom.style.setProperty("background", appearance.reduceTransparency ? "Canvas" : "transparent");
     }
     this.scheduleDiagnostics();
+    this.scheduleHeightMeasurement();
     this.scheduleCommandContextReport();
   }
 
@@ -860,6 +1348,7 @@ class EditorController {
     const diagnostics = presentedDiagnostics(this.configuration.language, text, this.configuration);
     this.view.dispatch(setDiagnostics(this.view.state, diagnostics));
     if (!this.diagnosticsPanel) {
+      this.scheduleHeightMeasurement();
       return;
     }
     this.diagnosticsPanel.textContent = diagnostics
@@ -870,6 +1359,7 @@ class EditorController {
       "cm-host-diagnostics-info",
       diagnostics.some(diagnostic => diagnostic.severity === "info")
     );
+    this.scheduleHeightMeasurement();
   }
 
   handleUpdate(update) {
@@ -880,6 +1370,7 @@ class EditorController {
       return;
     }
     this.scheduleDiagnostics();
+    this.scheduleHeightMeasurement();
     if (this.applyingHostChange) {
       this.scheduleCommandContextReport();
       return;
@@ -1103,7 +1594,7 @@ class EditorController {
       this.post({ type: "formatResult", requestID, success: false });
       return;
     }
-    const result = formatJSON(text);
+    const result = formatJSON(text, this.configuration.jsonKeyOrder);
     if (!result.available) {
       this.post({ type: "formatResult", requestID, success: false });
       return;
@@ -1809,6 +2300,7 @@ class EditorController {
   }
 
   destroy() {
+    this.resetHeightMeasurement();
     if (this.documentRef?.removeEventListener) {
       for (const [name, handler] of this.focusHandlers) {
         this.documentRef.removeEventListener(name, handler, true);
@@ -1844,6 +2336,10 @@ class EditorController {
     this.diagnosticsPanel?.remove();
     this.diagnosticsPanel = null;
     this.diagnosticsScheduled = false;
+    this.heightPolicy = { mode: "fillsAvailableScrollViewport", minimumVisibleRows: 0 };
+    this.lastObservedWidth = null;
+    this.lastReportedHeight = null;
+    this.heightMeasurementID = null;
     this.view = null;
     this.flushRequests.clear();
     this.pendingTransactions = [];

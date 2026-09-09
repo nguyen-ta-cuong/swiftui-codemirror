@@ -30,7 +30,21 @@ internal func resolvedCodeMirrorAppearance(
 #if canImport(AppKit)
   @MainActor
   internal final class CodeMirrorWebView: WKWebView {
+    var contentHeight: CGFloat?
+    var minimumHeight: CGFloat?
+
     override var undoManager: UndoManager? { nil }
+
+    override var intrinsicContentSize: NSSize {
+      var size = super.intrinsicContentSize
+      if let contentHeight {
+        size.height = contentHeight
+      }
+      if let minimumHeight {
+        size.height = max(size.height, minimumHeight)
+      }
+      return size
+    }
   }
 
   @MainActor
@@ -40,6 +54,7 @@ internal func resolvedCodeMirrorAppearance(
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
     public let theme: CodeMirrorTheme?
+    public let heightPolicy: CodeMirrorEditorHeightPolicy
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
@@ -48,15 +63,19 @@ internal func resolvedCodeMirrorAppearance(
     public init(
       session: CodeMirrorSession,
       replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
-      theme: CodeMirrorTheme? = nil
+      theme: CodeMirrorTheme? = nil,
+      heightPolicy: CodeMirrorEditorHeightPolicy = .fillsAvailableScrollViewport(
+        minimumVisibleRows: 0)
     ) {
       self.session = session
       self.replicaID = replicaID
       self.theme = theme
+      self.heightPolicy = heightPolicy
     }
 
     public func makeCoordinator() -> AnyObject {
-      CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      CodeMirrorEditorCoordinator(
+        session: session, replicaID: replicaID, heightPolicy: heightPolicy)
     }
 
     public func makeNSView(context: Context) -> WKWebView {
@@ -71,8 +90,32 @@ internal func resolvedCodeMirrorAppearance(
 
     public func updateNSView(_ nsView: WKWebView, context: Context) {
       let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
+      coordinator.update(heightPolicy: heightPolicy)
       coordinator.update(appearance: resolvedAppearance)
       coordinator.update(webView: nsView)
+    }
+
+    public func sizeThatFits(
+      _ proposal: ProposedViewSize, nsView: WKWebView, context: Context
+    ) -> CGSize? {
+      guard
+        let coordinator = context.coordinator as? CodeMirrorEditorCoordinator,
+        case .fillsAvailableScrollViewport(let minimumVisibleRows) = heightPolicy,
+        minimumVisibleRows > 0,
+        let minimumHeight = coordinator.minimumHeight
+      else {
+        return nil
+      }
+      var size = nsView.fittingSize
+      if let proposedWidth = proposal.width, proposedWidth.isFinite {
+        size.width = proposedWidth
+      }
+      if let proposedHeight = proposal.height, proposedHeight.isFinite {
+        size.height = max(proposedHeight, minimumHeight)
+      } else {
+        size.height = max(size.height, minimumHeight)
+      }
+      return size
     }
 
     public static func dismantleNSView(_ nsView: WKWebView, coordinator: AnyObject) {
@@ -115,12 +158,30 @@ internal func resolvedCodeMirrorAppearance(
   }
 #elseif canImport(UIKit)
   @MainActor
+  internal final class CodeMirrorWebView: WKWebView {
+    var contentHeight: CGFloat?
+    var minimumHeight: CGFloat?
+
+    override var intrinsicContentSize: CGSize {
+      var size = super.intrinsicContentSize
+      if let contentHeight {
+        size.height = contentHeight
+      }
+      if let minimumHeight {
+        size.height = max(size.height, minimumHeight)
+      }
+      return size
+    }
+  }
+
+  @MainActor
   public struct CodeMirrorEditor: UIViewRepresentable {
     public typealias UIViewType = WKWebView
 
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
     public let theme: CodeMirrorTheme?
+    public let heightPolicy: CodeMirrorEditorHeightPolicy
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
@@ -129,21 +190,25 @@ internal func resolvedCodeMirrorAppearance(
     public init(
       session: CodeMirrorSession,
       replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
-      theme: CodeMirrorTheme? = nil
+      theme: CodeMirrorTheme? = nil,
+      heightPolicy: CodeMirrorEditorHeightPolicy = .fillsAvailableScrollViewport(
+        minimumVisibleRows: 0)
     ) {
       self.session = session
       self.replicaID = replicaID
       self.theme = theme
+      self.heightPolicy = heightPolicy
     }
 
     public func makeCoordinator() -> AnyObject {
-      CodeMirrorEditorCoordinator(session: session, replicaID: replicaID)
+      CodeMirrorEditorCoordinator(
+        session: session, replicaID: replicaID, heightPolicy: heightPolicy)
     }
 
     public func makeUIView(context: Context) -> WKWebView {
       let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
       let configuration = makeWebViewConfiguration(coordinator: coordinator)
-      let webView = WKWebView(frame: .zero, configuration: configuration)
+      let webView = CodeMirrorWebView(frame: .zero, configuration: configuration)
       webView.isOpaque = false
       coordinator.attach(webView: webView)
       coordinator.update(appearance: resolvedAppearance)
@@ -152,8 +217,41 @@ internal func resolvedCodeMirrorAppearance(
 
     public func updateUIView(_ uiView: WKWebView, context: Context) {
       let coordinator = context.coordinator as! CodeMirrorEditorCoordinator
+      coordinator.update(heightPolicy: heightPolicy)
       coordinator.update(appearance: resolvedAppearance)
       coordinator.update(webView: uiView)
+    }
+
+    public func sizeThatFits(
+      _ proposal: ProposedViewSize, uiView: WKWebView, context: Context
+    ) -> CGSize? {
+      guard
+        let coordinator = context.coordinator as? CodeMirrorEditorCoordinator,
+        case .fillsAvailableScrollViewport(let minimumVisibleRows) = heightPolicy,
+        minimumVisibleRows > 0,
+        let minimumHeight = coordinator.minimumHeight
+      else {
+        return nil
+      }
+      let proposedWidth = proposal.width.flatMap { $0.isFinite ? $0 : nil }
+      let proposedHeight = proposal.height.flatMap { $0.isFinite ? $0 : nil }
+      var size = uiView.systemLayoutSizeFitting(
+        CGSize(
+          width: proposedWidth ?? UIView.layoutFittingCompressedSize.width,
+          height: proposedHeight ?? UIView.layoutFittingCompressedSize.height
+        ),
+        withHorizontalFittingPriority: proposedWidth == nil ? .fittingSizeLevel : .required,
+        verticalFittingPriority: proposedHeight == nil ? .fittingSizeLevel : .required
+      )
+      if let proposedWidth {
+        size.width = proposedWidth
+      }
+      if let proposedHeight {
+        size.height = max(proposedHeight, minimumHeight)
+      } else {
+        size.height = max(size.height, minimumHeight)
+      }
+      return size
     }
 
     public static func dismantleUIView(_ uiView: WKWebView, coordinator: AnyObject) {
@@ -200,10 +298,15 @@ internal func resolvedCodeMirrorAppearance(
 internal final class CodeMirrorEditorCoordinator: NSObject {
   static let messageHandlerName = "codeMirrorHost"
   private static let maximumPendingRequiredCommands = 32
+  private static let maximumIntrinsicHeight = 4096.0
 
   private weak var webView: WKWebView?
   private weak var session: CodeMirrorSession?
   private let replicaID: CodeMirrorReplicaID
+  private var heightPolicy: CodeMirrorEditorHeightPolicy
+  private var latestIntrinsicHeight: CGFloat?
+  private var latestMinimumHeight: CGFloat?
+  private var heightMeasurementID: UUID?
   private var loadID: UUID?
   private var allowedReadRoot: URL?
   private var isReady = false
@@ -240,10 +343,20 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   internal var pageIsReady: Bool { isReady }
   internal var pageIsConfigured: Bool { isConfigured }
   internal var initialNavigationPending: Bool { isAwaitingInitialNavigation }
+  internal var currentHeightPolicy: CodeMirrorEditorHeightPolicy { heightPolicy }
+  internal var intrinsicHeight: CGFloat? { latestIntrinsicHeight }
+  internal var minimumHeight: CGFloat? { latestMinimumHeight }
+  internal var currentHeightMeasurementID: UUID? { heightMeasurementID }
 
-  init(session: CodeMirrorSession, replicaID: CodeMirrorReplicaID) {
+  init(
+    session: CodeMirrorSession,
+    replicaID: CodeMirrorReplicaID,
+    heightPolicy: CodeMirrorEditorHeightPolicy = .fillsAvailableScrollViewport(
+      minimumVisibleRows: 0)
+  ) {
     self.session = session
     self.replicaID = replicaID
+    self.heightPolicy = heightPolicy.normalized
   }
 
   private func attachSessionReplica() throws -> UUID {
@@ -268,6 +381,8 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   }
 
   func attach(webView: WKWebView) {
+    clearReportedHeight()
+    heightMeasurementID = nil
     lifecycleID = UUID()
     acceptsReady = false
     isReady = false
@@ -305,8 +420,51 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     guard self.webView === webView else { return }
   }
 
+  func update(heightPolicy: CodeMirrorEditorHeightPolicy) {
+    let normalizedPolicy = heightPolicy.normalized
+    guard normalizedPolicy != self.heightPolicy else { return }
+    self.heightPolicy = normalizedPolicy
+    clearReportedHeight()
+    guard isConfigured else { return }
+    send(.setHeightPolicy(normalizedPolicy))
+  }
+
   func update(appearance: CodeMirrorAppearance) {
     session?.update(appearance: appearance, for: replicaID)
+  }
+
+  internal func receiveContentSize(
+    sessionID: CodeMirrorSessionID,
+    replicaID: CodeMirrorReplicaID,
+    loadID: UUID,
+    measurementID: UUID,
+    height: Double
+  ) {
+    guard isConfigured,
+      let session,
+      session.id == sessionID,
+      self.replicaID == replicaID,
+      self.loadID == loadID,
+      self.heightMeasurementID == measurementID,
+      height.isFinite,
+      height >= 0,
+      height <= Self.maximumIntrinsicHeight
+    else {
+      return
+    }
+    let measuredHeight = CGFloat(height)
+    guard measuredHeight.isFinite, measuredHeight >= 0 else { return }
+    switch heightPolicy {
+    case .contentSized:
+      guard latestIntrinsicHeight != measuredHeight else { return }
+      latestIntrinsicHeight = measuredHeight
+      setIntrinsicHeight(measuredHeight)
+    case .fillsAvailableScrollViewport(let minimumVisibleRows):
+      guard minimumVisibleRows > 0 else { return }
+      guard latestMinimumHeight != measuredHeight else { return }
+      latestMinimumHeight = measuredHeight
+      setMinimumHeight(measuredHeight)
+    }
   }
 
   func detach() {
@@ -325,6 +483,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     webView?.navigationDelegate = nil
     webView?.uiDelegate = nil
     webView?.stopLoading()
+    clearReportedHeight()
+    heightMeasurementID = nil
+    setIntrinsicHeight(nil)
     webView = nil
     session = nil
     loadID = nil
@@ -332,6 +493,29 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     pendingCommands.removeAll()
     isReady = false
     isConfigured = false
+  }
+
+  private func setIntrinsicHeight(_ height: CGFloat?) {
+    #if canImport(AppKit) || canImport(UIKit)
+      guard let webView = webView as? CodeMirrorWebView else { return }
+      webView.contentHeight = height
+      webView.invalidateIntrinsicContentSize()
+    #endif
+  }
+
+  private func setMinimumHeight(_ height: CGFloat?) {
+    #if canImport(AppKit) || canImport(UIKit)
+      guard let webView = webView as? CodeMirrorWebView else { return }
+      webView.minimumHeight = height
+      webView.invalidateIntrinsicContentSize()
+    #endif
+  }
+
+  private func clearReportedHeight() {
+    latestIntrinsicHeight = nil
+    latestMinimumHeight = nil
+    setIntrinsicHeight(nil)
+    setMinimumHeight(nil)
   }
 
   private func send(_ command: CodeMirrorHostCommand) {
@@ -368,6 +552,12 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       replacePending(
         where: { command in
           if case .updateConfiguration = command { return true }
+          return false
+        }, with: command)
+    case .setHeightPolicy:
+      replacePending(
+        where: { command in
+          if case .setHeightPolicy = command { return true }
           return false
         }, with: command)
     case .apply, .reconcile:
@@ -459,9 +649,19 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
   private func evaluate(_ command: CodeMirrorHostCommand, lifecycleID: UUID? = nil) {
     guard let webView else { return }
     let commandLifecycleID = lifecycleID ?? self.lifecycleID
+    var payload = command.payload
+    switch command {
+    case .configure, .updateConfiguration, .setHeightPolicy:
+      let measurementID = UUID()
+      heightMeasurementID = measurementID
+      clearReportedHeight()
+      payload["measurementID"] = measurementID.uuidString
+    default:
+      break
+    }
     webView.callAsyncJavaScript(
       "CodeMirrorHost.receive(command)",
-      arguments: ["command": command.payload],
+      arguments: ["command": payload],
       in: nil,
       in: .page
     ) { [weak self] result in
@@ -481,6 +681,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     lifecycleID = UUID()
     let queued = pendingCommands
     pendingCommands.removeAll()
+    clearReportedHeight()
+    heightMeasurementID = nil
+    setIntrinsicHeight(nil)
     for command in queued {
       session?.failQueuedOperation(command)
     }
@@ -565,6 +768,16 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     do {
       let inbound = try CodeMirrorInboundMessage.decode(message.body)
       guard acceptsReady else { return }
+      if case .contentSize(let contentSize) = inbound {
+        receiveContentSize(
+          sessionID: contentSize.sessionID,
+          replicaID: contentSize.replicaID,
+          loadID: contentSize.loadID,
+          measurementID: contentSize.measurementID,
+          height: contentSize.height
+        )
+        return
+      }
       let normalizedInbound: CodeMirrorInboundMessage
       if case .ready = inbound {
         isReady = true
@@ -585,16 +798,21 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
       }
       session?.receive(normalizedInbound)
       if case .configured = normalizedInbound {
-        isConfigured = true
-        let queued = pendingCommands
-        pendingCommands.removeAll()
-        for command in queued {
-          guard session?.hasPendingOperation(command) != false else { continue }
-          evaluate(command)
-        }
+        completeConfiguration()
       }
     } catch {
       transportFailed()
+    }
+  }
+
+  private func completeConfiguration() {
+    isConfigured = true
+    send(.setHeightPolicy(heightPolicy))
+    let queued = pendingCommands
+    pendingCommands.removeAll()
+    for command in queued {
+      guard session?.hasPendingOperation(command) != false else { continue }
+      evaluate(command)
     }
   }
 
@@ -626,6 +844,9 @@ internal final class CodeMirrorEditorCoordinator: NSObject {
     }
     let hadLivePage = isReady || isConfigured
     let previousLoadID = loadID
+    clearReportedHeight()
+    heightMeasurementID = nil
+    setIntrinsicHeight(nil)
     isReady = false
     isConfigured = false
     acceptsReady = false

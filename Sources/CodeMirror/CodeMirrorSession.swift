@@ -5,6 +5,7 @@ internal enum CodeMirrorHostCommand: Sendable {
     configuration: CodeMirrorConfiguration, snapshot: CodeMirrorSnapshot,
     replicaID: CodeMirrorReplicaID, loadID: UUID)
   case updateConfiguration(CodeMirrorConfiguration)
+  case setHeightPolicy(CodeMirrorEditorHeightPolicy)
   case apply(CodeMirrorSnapshot)
   case reconcile(snapshot: CodeMirrorSnapshot, preserveLocalChanges: Bool)
   case acknowledge(revision: CodeMirrorRevision)
@@ -17,9 +18,18 @@ internal enum CodeMirrorHostCommand: Sendable {
   case invalidate
 }
 
+internal struct CodeMirrorContentSize: Sendable {
+  let sessionID: CodeMirrorSessionID
+  let replicaID: CodeMirrorReplicaID
+  let loadID: UUID
+  let measurementID: UUID
+  let height: Double
+}
+
 internal enum CodeMirrorInboundMessage {
   case ready(sessionID: CodeMirrorSessionID?, replicaID: CodeMirrorReplicaID?, loadID: UUID?)
   case configured(sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID)
+  case contentSize(CodeMirrorContentSize)
   case focusTraversal(
     sessionID: CodeMirrorSessionID, replicaID: CodeMirrorReplicaID, loadID: UUID, forward: Bool)
   case commandContext(
@@ -111,6 +121,8 @@ private struct WireMessage: Codable {
   let direction: String?
   let success: Bool?
   let code: String?
+  let height: Double?
+  let measurementID: String?
 
   func decodeMessage() throws -> CodeMirrorInboundMessage {
     switch type {
@@ -125,6 +137,16 @@ private struct WireMessage: Codable {
         sessionID: try sessionID.required().sessionID(),
         replicaID: try replicaID.required().replicaID(),
         loadID: try loadID.required().uuid()
+      )
+    case "contentSize":
+      return .contentSize(
+        CodeMirrorContentSize(
+          sessionID: try sessionID.required().sessionID(),
+          replicaID: try replicaID.required().replicaID(),
+          loadID: try loadID.required().uuid(),
+          measurementID: try measurementID.required().uuid(),
+          height: try height.required()
+        )
       )
     case "focusTraversal":
       guard let direction, direction == "next" || direction == "previous" else {
@@ -343,6 +365,11 @@ extension CodeMirrorHostCommand {
         "type": "updateConfiguration",
         "configuration": configurationPayload(configuration),
       ]
+    case .setHeightPolicy(let policy):
+      return [
+        "type": "setHeightPolicy",
+        "policy": policy.payload
+      ]
     case .apply(let snapshot):
       return [
         "type": "apply",
@@ -402,7 +429,7 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     "reduceTransparency": configuration.appearance.reduceTransparency,
     "theme": configuration.appearance.theme.map(themePayload) ?? NSNull(),
   ]
-  return [
+  var payload: [String: Any] = [
     "language": configuration.language.rawValue,
     "isReadOnly": configuration.isReadOnly,
     "wrapsLines": configuration.wrapsLines,
@@ -415,6 +442,10 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     ) ?? NSNull(),
     "appearance": appearance,
   ]
+  if let jsonKeyOrder = configuration.jsonKeyOrder {
+    payload["jsonKeyOrder"] = jsonKeyOrder.rawValue
+  }
+  return payload
 }
 
 private func diagnosticPresentationPolicyPayload(
@@ -884,7 +915,7 @@ public final class CodeMirrorSession {
     switch message {
     case .ready(let sessionID?, let replicaID?, let loadID?):
       receiveReady(sessionID: sessionID, replicaID: replicaID, loadID: loadID)
-    case .ready:
+    case .ready, .contentSize:
       return
     case .configured(let sessionID, let replicaID, let loadID):
       receiveConfigured(sessionID: sessionID, replicaID: replicaID, loadID: loadID)

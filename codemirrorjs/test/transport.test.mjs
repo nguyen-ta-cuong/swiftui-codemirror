@@ -158,6 +158,79 @@ test("formats JSON lexically without changing key order, duplicates, numbers, or
   ].join("\n"));
 });
 
+test("formats JSON with sorted keys while preserving raw tokens and array order", () => {
+  const source = '{"z":1e+03,"b":-0,"\\u0062":1.00,"a":{"z":"\\u0061","a":1.00,"\\u0061":"\\u0062"},"items":[{"z":"\\u0061","a":true},{"z":2,"a":false}]}';
+  const result = formatJSON(source, "sorted");
+  assert.equal(result.available, true);
+  assert.equal(result.text, [
+    "{",
+    "  \"a\": {",
+    "    \"a\": 1.00,",
+    "    \"\\u0061\": \"\\u0062\",",
+    "    \"z\": \"\\u0061\"",
+    "  },",
+    "  \"b\": -0,",
+    "  \"\\u0062\": 1.00,",
+    "  \"items\": [",
+    "    {",
+    "      \"a\": true,",
+    "      \"z\": \"\\u0061\"",
+    "    },",
+    "    {",
+    "      \"a\": false,",
+    "      \"z\": 2",
+    "    }",
+    "  ],",
+    "  \"z\": 1e+03",
+    "}"
+  ].join("\n"));
+});
+
+test("controller formats sorted JSON and reports success", () => {
+  const source = '{"ok":true,"message":"hello from mockphine cli"}';
+  const harness = makeController(source);
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.configuration = {
+    ...controller.configuration,
+    language: "json",
+    jsonKeyOrder: "sorted"
+  };
+  controller.format("sorted-format");
+  assert.equal(harness.text, formatJSON(source, "sorted").text);
+  assert.deepEqual(harness.messages.at(-1), {
+    type: "formatResult",
+    requestID: "sorted-format",
+    success: true,
+    sessionID: "session",
+    replicaID: "replica",
+    loadID: "load"
+  });
+  controller.destroy();
+});
+
+test("configuration clearing returns JSON formatting to encounter order", () => {
+  const source = '{"z":1,"a":2}';
+  const harness = makeController(source);
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.configuration = {
+    ...controller.configuration,
+    language: "json",
+    jsonKeyOrder: "sorted"
+  };
+  controller.format("sorted-format");
+  controller.view.state = EditorState.create({ doc: source });
+  controller.updateConfiguration({ language: "json" });
+  assert.equal(controller.configuration.jsonKeyOrder, "preserve");
+  controller.format("preserve-format");
+  assert.equal(harness.text, formatJSON(source).text);
+  assert.equal(harness.messages.at(-1).requestID, "preserve-format");
+  controller.destroy();
+});
+
 test("invalid JSON remains unchanged with an advisory diagnostic", () => {
   const source = '{"unfinished":';
   const result = formatJSON(source);
@@ -1112,10 +1185,12 @@ test("initial configuration replaces only the disabled loading document and neve
   assert.equal(controller.initializing, true);
   applyLocalChange(controller, { changes: { from: 0, insert: "typed before configure" } });
   assert.equal(controller.localEditBeforeConfiguration, true);
-  controller.configure({
+  controller.receive({
     sessionID: "session",
     replicaID: "replica",
     loadID: "load",
+    type: "configure",
+    measurementID: "00000000-0000-4000-8000-000000000001",
     revision: 7,
     text: "authoritative initial source",
     selections: [],
