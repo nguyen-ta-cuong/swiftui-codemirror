@@ -231,6 +231,30 @@ export function documentDiagnostics(language, value) {
   }
 }
 
+function diagnosticPresentationPolicy(value) {
+  if (!value || typeof value !== "object") {
+    return { allowsEmpty: false, consequence: null };
+  }
+  return {
+    allowsEmpty: value.allowsEmpty === true,
+    consequence: typeof value.consequence === "string" ? value.consequence : null
+  };
+}
+
+function presentedDiagnostics(language, value, configuration) {
+  const diagnostics = documentDiagnostics(language, value);
+  const policy = diagnosticPresentationPolicy(configuration?.diagnosticPresentationPolicy);
+  const filtered = policy.allowsEmpty && value.length === 0
+    ? diagnostics.filter(diagnostic => diagnostic.severity !== "error")
+    : diagnostics;
+  if (!policy.consequence) {
+    return filtered;
+  }
+  return filtered.map(diagnostic => diagnostic.severity === "error"
+    ? { ...diagnostic, message: `${diagnostic.message} ${policy.consequence}` }
+    : diagnostic);
+}
+
 export function jsonLiteralCompletion(context) {
   const word = context.matchBefore(/[A-Za-z]*/);
   if (!context.explicit && (!word || word.from === word.to)) {
@@ -571,7 +595,8 @@ class EditorController {
       showsLineNumbers: true,
       maximumPendingTransactions: 64,
       appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null },
-      editorName: "Code editor"
+      editorName: "Code editor",
+      diagnosticPresentationPolicy: null
     };
     this.hostText = "";
     this.hostRevision = 0;
@@ -832,7 +857,7 @@ class EditorController {
       return;
     }
     const text = this.view.state.doc.toString();
-    const diagnostics = documentDiagnostics(this.configuration.language, text);
+    const diagnostics = presentedDiagnostics(this.configuration.language, text, this.configuration);
     this.view.dispatch(setDiagnostics(this.view.state, diagnostics));
     if (!this.diagnosticsPanel) {
       return;

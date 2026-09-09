@@ -410,7 +410,19 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     "commandTimeoutMilliseconds": configuration.commandTimeoutMilliseconds,
     "maximumPendingTransactions": configuration.maximumPendingTransactions,
     "editorName": configuration.editorName ?? "",
+    "diagnosticPresentationPolicy": configuration.diagnosticPresentationPolicy.map(
+      diagnosticPresentationPolicyPayload
+    ) ?? NSNull(),
     "appearance": appearance,
+  ]
+}
+
+private func diagnosticPresentationPolicyPayload(
+  _ policy: CodeMirrorDiagnosticPresentationPolicy
+) -> [String: Any] {
+  [
+    "allowsEmpty": policy.allowsEmpty,
+    "consequence": policy.consequence ?? NSNull(),
   ]
 }
 

@@ -203,6 +203,66 @@ test("the editor controller publishes diagnostics into selectable visible state"
   controller.destroy();
 });
 
+test("diagnostic presentation policy filters allowed empty syntax and appends literal consequences", async () => {
+  const harness = makeController('{"enabled":');
+  const { controller } = harness;
+  const consequence = "<script>Response text is saved.</script>";
+  const panel = {
+    textContent: "",
+    hidden: true,
+    classList: { toggle() {} },
+    remove() {}
+  };
+  controller.configured = true;
+  controller.initializing = false;
+  controller.hostRevision = 7;
+  controller.localRevision = 7;
+  controller.configuration = {
+    ...controller.configuration,
+    language: "json",
+    diagnosticPresentationPolicy: { allowsEmpty: false, consequence }
+  };
+  controller.diagnosticsPanel = panel;
+  controller.refreshDiagnostics();
+  assert.equal(panel.hidden, false);
+  assert.match(panel.textContent, /<script>Response text is saved\.<\/script>/);
+
+  controller.view.state = EditorState.create({ doc: "{}" });
+  controller.refreshDiagnostics();
+  assert.equal(panel.hidden, true);
+  assert.equal(panel.textContent, "");
+
+  controller.view.state = EditorState.create({ doc: "plain source" });
+  controller.updateConfiguration({ language: "text" });
+  await Promise.resolve();
+  assert.equal(panel.hidden, true);
+  assert.equal(panel.textContent, "");
+
+  controller.view.state = EditorState.create({ doc: "" });
+  controller.updateConfiguration({
+    language: "json",
+    diagnosticPresentationPolicy: { allowsEmpty: true, consequence }
+  });
+  await Promise.resolve();
+  assert.equal(panel.hidden, true);
+  assert.equal(panel.textContent, "");
+  assert.equal(controller.hostRevision, 7);
+  assert.equal(controller.localRevision, 7);
+
+  controller.updateConfiguration({
+    diagnosticPresentationPolicy: { allowsEmpty: false, consequence }
+  });
+  await Promise.resolve();
+  assert.equal(panel.hidden, false);
+  assert.match(panel.textContent, /<script>Response text is saved\.<\/script>/);
+
+  controller.view.state = EditorState.create({ doc: "{" + "x".repeat(1024 * 1024) + "}" });
+  controller.refreshDiagnostics();
+  assert.match(panel.textContent, /unavailable|fully editable/i);
+  assert.doesNotMatch(panel.textContent, /Response text is saved/);
+  controller.destroy();
+});
+
 test("large language documents expose selectable unavailable state without truncating source", () => {
   const source = "{" + "x".repeat(1024 * 1024) + "}";
   const diagnostics = documentDiagnostics("json", source);

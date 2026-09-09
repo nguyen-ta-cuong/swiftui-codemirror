@@ -655,6 +655,109 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertEqual(try JSONDecoder().decode(CodeMirrorAppearance.self, from: encoded), appearance)
   }
 
+  func testDiagnosticPresentationPolicyRoundTripsAndDefaultsWhenOmitted() throws {
+    let policy = CodeMirrorDiagnosticPresentationPolicy(
+      allowsEmpty: true, consequence: "Response text is saved.")
+    let configuration = CodeMirrorConfiguration(
+      language: .json, diagnosticPresentationPolicy: policy)
+    let encoded = try JSONEncoder().encode(configuration)
+    XCTAssertEqual(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: encoded), configuration)
+
+    var legacyObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    legacyObject.removeValue(forKey: "diagnosticPresentationPolicy")
+    let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+    XCTAssertNil(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: legacyData)
+        .diagnosticPresentationPolicy)
+  }
+
+  func testDiagnosticPresentationPolicyBroadcastPreservesReplicaIdentityAndRevision() throws {
+    let initialPolicy = CodeMirrorDiagnosticPresentationPolicy(
+      allowsEmpty: true, consequence: "Response text is saved.")
+    let updatedPolicy = CodeMirrorDiagnosticPresentationPolicy(
+      allowsEmpty: false, consequence: "Draft is not saved.")
+    let session = CodeMirrorSession(
+      initialText: "source",
+      configuration: CodeMirrorConfiguration(
+        language: .json, diagnosticPresentationPolicy: initialPolicy)
+    ) { _ in .accept }
+    let firstID = CodeMirrorReplicaID()
+    let secondID = CodeMirrorReplicaID()
+    var firstCommands: [CodeMirrorHostCommand] = []
+    var secondCommands: [CodeMirrorHostCommand] = []
+    let firstLoadID = try session.attach(
+      replicaID: firstID, isFocused: { false }, send: { firstCommands.append($0) })
+    let secondLoadID = try session.attach(
+      replicaID: secondID, isFocused: { false }, send: { secondCommands.append($0) })
+    session.receive(.ready(sessionID: session.id, replicaID: firstID, loadID: firstLoadID))
+    session.receive(.ready(sessionID: session.id, replicaID: secondID, loadID: secondLoadID))
+
+    func assertInitialConfiguration(
+      _ command: CodeMirrorHostCommand,
+      replicaID: CodeMirrorReplicaID,
+      loadID: UUID
+    ) throws {
+      guard
+        case .configure(
+          let configuration,
+          let snapshot,
+          let commandReplicaID,
+          let commandLoadID
+        ) = command
+      else {
+        return XCTFail("replica did not receive initial configuration")
+      }
+      XCTAssertEqual(configuration.diagnosticPresentationPolicy, initialPolicy)
+      XCTAssertEqual(snapshot.sessionID, session.id)
+      XCTAssertEqual(snapshot.revision, .zero)
+      XCTAssertEqual(snapshot.text, "source")
+      XCTAssertEqual(commandReplicaID, replicaID)
+      XCTAssertEqual(commandLoadID, loadID)
+      let payload = command.payload
+      let configurationPayload = try XCTUnwrap(payload["configuration"] as? [String: Any])
+      let policyPayload = try XCTUnwrap(
+        configurationPayload["diagnosticPresentationPolicy"] as? [String: Any])
+      XCTAssertEqual(policyPayload["allowsEmpty"] as? Bool, true)
+      XCTAssertEqual(policyPayload["consequence"] as? String, initialPolicy.consequence)
+    }
+
+    try assertInitialConfiguration(firstCommands[0], replicaID: firstID, loadID: firstLoadID)
+    try assertInitialConfiguration(secondCommands[0], replicaID: secondID, loadID: secondLoadID)
+    let before = try session.snapshot()
+    firstCommands.removeAll()
+    secondCommands.removeAll()
+
+    session.update(
+      configuration: CodeMirrorConfiguration(
+        language: .json, diagnosticPresentationPolicy: updatedPolicy))
+
+    XCTAssertEqual(try session.snapshot(), before)
+    let updatedConfigurations = [firstCommands, secondCommands].compactMap { commands in
+      commands.compactMap { command -> CodeMirrorConfiguration? in
+        guard case .updateConfiguration(let configuration) = command else { return nil }
+        return configuration
+      }.first
+    }
+    let expectedConfigurations = [
+      CodeMirrorConfiguration(language: .json, diagnosticPresentationPolicy: updatedPolicy),
+      CodeMirrorConfiguration(language: .json, diagnosticPresentationPolicy: updatedPolicy),
+    ]
+    XCTAssertEqual(updatedConfigurations, expectedConfigurations)
+    for commands in [firstCommands, secondCommands] {
+      guard let command = commands.first else {
+        return XCTFail("replica did not receive policy update")
+      }
+      let payload = command.payload
+      let configurationPayload = try XCTUnwrap(payload["configuration"] as? [String: Any])
+      let policyPayload = try XCTUnwrap(
+        configurationPayload["diagnosticPresentationPolicy"] as? [String: Any])
+      XCTAssertEqual(policyPayload["allowsEmpty"] as? Bool, false)
+      XCTAssertEqual(policyPayload["consequence"] as? String, updatedPolicy.consequence)
+    }
+  }
+
   func testReplicaThemeUsesNumericPayloadWithoutMutatingSharedConfiguration() throws {
     let session = CodeMirrorSession(initialText: "source") { _ in .accept }
     let replicaID = CodeMirrorReplicaID()

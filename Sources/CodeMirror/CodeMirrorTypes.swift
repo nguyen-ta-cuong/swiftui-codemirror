@@ -147,6 +147,16 @@ public struct CodeMirrorAppearance: Equatable, Sendable, Codable {
   }
 }
 
+public struct CodeMirrorDiagnosticPresentationPolicy: Equatable, Sendable, Codable {
+  public var allowsEmpty: Bool
+  public var consequence: String?
+
+  public init(allowsEmpty: Bool = false, consequence: String? = nil) {
+    self.allowsEmpty = allowsEmpty
+    self.consequence = consequence
+  }
+}
+
 public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
   public var language: CodeMirrorLanguage
   public var isReadOnly: Bool
@@ -156,6 +166,7 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
   public var maximumPendingTransactions: Int
   public var appearance: CodeMirrorAppearance
   public var editorName: String?
+  public var diagnosticPresentationPolicy: CodeMirrorDiagnosticPresentationPolicy?
 
   public init(
     language: CodeMirrorLanguage = .text,
@@ -165,7 +176,8 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     commandTimeoutMilliseconds: Int = 2_000,
     maximumPendingTransactions: Int = 64,
     appearance: CodeMirrorAppearance = CodeMirrorAppearance(),
-    editorName: String? = nil
+    editorName: String? = nil,
+    diagnosticPresentationPolicy: CodeMirrorDiagnosticPresentationPolicy? = nil
   ) {
     self.language = language
     self.isReadOnly = isReadOnly
@@ -175,6 +187,7 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     self.maximumPendingTransactions = maximumPendingTransactions
     self.appearance = appearance
     self.editorName = editorName
+    self.diagnosticPresentationPolicy = diagnosticPresentationPolicy
   }
 
   internal var normalized: CodeMirrorConfiguration {
