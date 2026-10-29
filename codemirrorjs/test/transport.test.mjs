@@ -442,6 +442,61 @@ test("malformed custom theme values are rejected without entering the appearance
   controller.destroy();
 });
 
+test("editor font styles the scroller so the base theme monospace rule does not win", async () => {
+  const source = await readFile(new URL("../codemirror.js", import.meta.url), "utf8");
+  assert.match(source, /"\.cm-scroller": font\s*\? \{ fontFamily: font\.family \? `"\$\{font\.family\}", \$\{defaultFontFamily\}` : defaultFontFamily, fontSize: `\$\{font\.size\}px` \}/);
+  assert.match(source, /this\.appearanceCompartment\.of\(appearanceExtension\(this\.configuration\.appearance, null, null\)\)/);
+  assert.doesNotMatch(source, /style\.setProperty\("font-family"/);
+});
+
+test("editor font reconfiguration keeps state and clears back to the default stack", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.hostRevision = 3;
+  controller.localRevision = 3;
+  controller.view.state = EditorState.create({
+    doc: "source",
+    selection: { anchor: 2, head: 5 }
+  });
+  controller.updateConfiguration({ appearance: { font: { family: "JetBrains Mono", size: 15 } } });
+  assert.deepEqual(controller.configuration.appearance.font, { family: "JetBrains Mono", size: 15 });
+  assert.equal(harness.text, "source");
+  assert.deepEqual(controller.view.state.selection.ranges.map(range => [range.from, range.to]), [[2, 5]]);
+  assert.equal(controller.hostRevision, 3);
+  assert.equal(controller.localRevision, 3);
+
+  controller.updateConfiguration({ appearance: { font: { family: null, size: 11 } } });
+  assert.deepEqual(controller.configuration.appearance.font, { family: null, size: 11 });
+  controller.updateConfiguration({ appearance: { font: null } });
+  assert.equal(controller.configuration.appearance.font, null);
+  controller.destroy();
+});
+
+test("malformed editor fonts are rejected without entering the appearance state", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  for (const font of [
+    { family: "Menlo", size: 5 },
+    { family: "Menlo", size: 73 },
+    { family: "Menlo", size: Number.NaN },
+    { family: "", size: 13 },
+    { family: "Bad\"Family", size: 13 },
+    { family: "Bad\\Family", size: 13 },
+    { family: "Bad\nFamily", size: 13 },
+    { family: "x".repeat(201), size: 13 },
+    { family: 7, size: 13 },
+    "Menlo"
+  ]) {
+    controller.updateConfiguration({ appearance: { font } });
+    assert.equal(controller.configuration.appearance.font, null, JSON.stringify(font));
+  }
+  controller.destroy();
+});
+
 test("runtime notices retain installed permission text and classify non-bundled locks", async () => {
   const notices = await readFile(
     new URL("../../Sources/CodeMirror/web.bundle/THIRD-PARTY-NOTICES.md", import.meta.url),

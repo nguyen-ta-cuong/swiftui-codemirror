@@ -719,6 +719,35 @@ function validTheme(value) {
   return Object.values(theme).every(Boolean) ? theme : null;
 }
 
+const defaultFontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
+
+function validFont(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  if (!Number.isFinite(value.size) || value.size < 6 || value.size > 72) {
+    return null;
+  }
+  const family = value.family ?? null;
+  if (family !== null && (typeof family !== "string" || family.length === 0 || family.length > 200 || /["\\\u0000-\u001f\u007f-\u009f]/.test(family))) {
+    return null;
+  }
+  return { family, size: value.size };
+}
+
+function fontTheme(font) {
+  return EditorView.theme({
+    ".cm-scroller": font
+      ? { fontFamily: font.family ? `"${font.family}", ${defaultFontFamily}` : defaultFontFamily, fontSize: `${font.size}px` }
+      : { fontFamily: defaultFontFamily }
+  });
+}
+
+function appearanceExtension(appearance, theme, font) {
+  const colors = appearance.colorScheme === "dark" ? darkTheme(appearance.increaseContrast, theme) : lightTheme(appearance.increaseContrast, theme);
+  return [colors, fontTheme(font)];
+}
+
 function customTheme(colorScheme, theme) {
   const background = rgbaColor(theme.background);
   const foreground = rgbaColor(theme.foreground);
@@ -856,7 +885,7 @@ class EditorController {
       wrapsLines: false,
       showsLineNumbers: true,
       maximumPendingTransactions: 64,
-      appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null },
+      appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null, font: null },
       editorName: "Code editor",
       diagnosticPresentationPolicy: null,
       jsonKeyOrder: "preserve"
@@ -953,7 +982,7 @@ class EditorController {
           ...searchKeymap
         ]),
         this.languageCompartment.of([]),
-        this.appearanceCompartment.of(lightTheme(false)),
+        this.appearanceCompartment.of(appearanceExtension(this.configuration.appearance, null, null)),
         this.lineNumberCompartment.of(lineNumbers()),
         this.readOnlyCompartment.of(EditorState.readOnly.of(true)),
         this.lineWrappingCompartment.of([]),
@@ -1287,6 +1316,7 @@ class EditorController {
       }
     };
     this.configuration.appearance.theme = validTheme(this.configuration.appearance.theme);
+    this.configuration.appearance.font = validFont(this.configuration.appearance.font);
     if (!this.view) {
       return;
     }
@@ -1296,7 +1326,7 @@ class EditorController {
     this.view.dispatch({
       effects: [
         this.languageCompartment.reconfigure(languageExtension(this.configuration.language, text)),
-        this.appearanceCompartment.reconfigure(appearance.colorScheme === "dark" ? darkTheme(appearance.increaseContrast, theme) : lightTheme(appearance.increaseContrast, theme)),
+        this.appearanceCompartment.reconfigure(appearanceExtension(appearance, theme, appearance.font)),
         this.lineNumberCompartment.reconfigure(this.configuration.showsLineNumbers ? lineNumbers() : []),
         this.readOnlyCompartment.reconfigure(this.initializing || this.configuration.isReadOnly ? EditorState.readOnly.of(true) : []),
         this.lineWrappingCompartment.reconfigure(this.configuration.wrapsLines ? EditorView.lineWrapping : []),
@@ -1317,7 +1347,6 @@ class EditorController {
     this.view.dom.setAttribute("spellcheck", "false");
     this.view.dom.setAttribute("aria-busy", this.initializing ? "true" : "false");
     this.view.dom.setAttribute("aria-readonly", (this.initializing || this.configuration.isReadOnly) ? "true" : "false");
-    this.view.dom.style.setProperty("font-family", "ui-monospace, SFMono-Regular, Menlo, monospace");
     this.view.dom.style.setProperty("transition", this.configuration.appearance.reduceMotion ? "none" : "opacity 120ms ease");
     if (theme) {
       this.view.dom.style.removeProperty?.("background");

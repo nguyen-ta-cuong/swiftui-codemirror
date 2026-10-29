@@ -13,7 +13,8 @@ internal func resolvedCodeMirrorAppearance(
   systemIncreaseContrast: Bool,
   accessibilityReduceMotion: Bool,
   accessibilityReduceTransparency: Bool,
-  theme: CodeMirrorTheme? = nil
+  theme: CodeMirrorTheme? = nil,
+  font: CodeMirrorFont? = nil
 ) -> CodeMirrorAppearance {
   let configuredAppearance = configuration.appearance
   return CodeMirrorAppearance(
@@ -23,7 +24,8 @@ internal func resolvedCodeMirrorAppearance(
     reduceMotion: configuredAppearance.reduceMotion || accessibilityReduceMotion,
     reduceTransparency: configuredAppearance.reduceTransparency
       || accessibilityReduceTransparency,
-    theme: theme ?? configuredAppearance.theme
+    theme: theme ?? configuredAppearance.theme,
+    font: font ?? configuredAppearance.font
   )
 }
 
@@ -54,6 +56,7 @@ internal func resolvedCodeMirrorAppearance(
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
     public let theme: CodeMirrorTheme?
+    public let font: CodeMirrorFont?
     public let heightPolicy: CodeMirrorEditorHeightPolicy
 
     @Environment(\.colorScheme) private var colorScheme
@@ -64,12 +67,14 @@ internal func resolvedCodeMirrorAppearance(
       session: CodeMirrorSession,
       replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
       theme: CodeMirrorTheme? = nil,
+      font: CodeMirrorFont? = nil,
       heightPolicy: CodeMirrorEditorHeightPolicy = .fillsAvailableScrollViewport(
         minimumVisibleRows: 0)
     ) {
       self.session = session
       self.replicaID = replicaID
       self.theme = theme
+      self.font = font
       self.heightPolicy = heightPolicy
     }
 
@@ -129,7 +134,8 @@ internal func resolvedCodeMirrorAppearance(
         systemIncreaseContrast: systemIncreaseContrast,
         accessibilityReduceMotion: accessibilityReduceMotion,
         accessibilityReduceTransparency: accessibilityReduceTransparency,
-        theme: theme
+        theme: theme,
+        font: font
       )
     }
 
@@ -181,6 +187,7 @@ internal func resolvedCodeMirrorAppearance(
     public let session: CodeMirrorSession
     public let replicaID: CodeMirrorReplicaID
     public let theme: CodeMirrorTheme?
+    public let font: CodeMirrorFont?
     public let heightPolicy: CodeMirrorEditorHeightPolicy
 
     @Environment(\.colorScheme) private var colorScheme
@@ -191,12 +198,14 @@ internal func resolvedCodeMirrorAppearance(
       session: CodeMirrorSession,
       replicaID: CodeMirrorReplicaID = CodeMirrorReplicaID(),
       theme: CodeMirrorTheme? = nil,
+      font: CodeMirrorFont? = nil,
       heightPolicy: CodeMirrorEditorHeightPolicy = .fillsAvailableScrollViewport(
         minimumVisibleRows: 0)
     ) {
       self.session = session
       self.replicaID = replicaID
       self.theme = theme
+      self.font = font
       self.heightPolicy = heightPolicy
     }
 
@@ -265,7 +274,8 @@ internal func resolvedCodeMirrorAppearance(
         systemIncreaseContrast: systemIncreaseContrast,
         accessibilityReduceMotion: accessibilityReduceMotion,
         accessibilityReduceTransparency: accessibilityReduceTransparency,
-        theme: theme
+        theme: theme,
+        font: font
       )
     }
 

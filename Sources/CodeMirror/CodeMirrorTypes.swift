@@ -102,6 +102,58 @@ public struct CodeMirrorRGBA: Equatable, Hashable, Sendable, Codable {
   }
 }
 
+public struct CodeMirrorFont: Equatable, Hashable, Sendable, Codable {
+  public static let sizeRange: ClosedRange<Double> = 6...72
+  public static let maximumFamilyLength = 200
+
+  public let family: String?
+  public let size: Double
+
+  public init?(family: String? = nil, size: Double) {
+    guard Self.sizeRange.contains(size), Self.isValidFamily(family) else {
+      return nil
+    }
+    self.family = family
+    self.size = size
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case family
+    case size
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let family = try container.decodeIfPresent(String.self, forKey: .family)
+    let size = try container.decode(Double.self, forKey: .size)
+    guard let value = Self(family: family, size: size) else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .size,
+        in: container,
+        debugDescription:
+          "CodeMirrorFont needs a size from 6 to 72 and a nonempty family of at most 200 characters without quotes, backslashes, or control characters."
+      )
+    }
+    self = value
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encodeIfPresent(family, forKey: .family)
+    try container.encode(size, forKey: .size)
+  }
+
+  private static func isValidFamily(_ family: String?) -> Bool {
+    guard let family else {
+      return true
+    }
+    return !family.isEmpty && family.utf16.count <= maximumFamilyLength
+      && !family.unicodeScalars.contains {
+        $0 == "\"" || $0 == "\\" || CharacterSet.controlCharacters.contains($0)
+      }
+  }
+}
+
 public struct CodeMirrorTheme: Equatable, Hashable, Sendable, Codable {
   public let background: CodeMirrorRGBA
   public let foreground: CodeMirrorRGBA
@@ -136,19 +188,22 @@ public struct CodeMirrorAppearance: Equatable, Sendable, Codable {
   public var reduceMotion: Bool
   public var reduceTransparency: Bool
   public var theme: CodeMirrorTheme?
+  public var font: CodeMirrorFont?
 
   public init(
     colorScheme: CodeMirrorColorScheme = .system,
     increaseContrast: Bool = false,
     reduceMotion: Bool = false,
     reduceTransparency: Bool = false,
-    theme: CodeMirrorTheme? = nil
+    theme: CodeMirrorTheme? = nil,
+    font: CodeMirrorFont? = nil
   ) {
     self.colorScheme = colorScheme
     self.increaseContrast = increaseContrast
     self.reduceMotion = reduceMotion
     self.reduceTransparency = reduceTransparency
     self.theme = theme
+    self.font = font
   }
 }
 

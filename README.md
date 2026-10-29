@@ -86,6 +86,14 @@ CodeMirrorEditor(session: session, theme: theme)
 
 Pass `nil` to retain the existing light, dark, or high-contrast renderer. The theme is presentation state and is never persisted in a document.
 
+For a per-editor font, pass a validated `CodeMirrorFont`. Its size runs from 6 to 72 points. A `nil` family keeps the system monospaced stack (`ui-monospace, SFMono-Regular, Menlo, monospace`) at the given size; a named family must be nonempty, at most 200 UTF-16 units, and free of quotes, backslashes, and control characters, and falls back to the same stack when it is not installed. Like the theme, the font is carried per replica and leaves session text, revisions, selections, and history untouched.
+
+```swift
+CodeMirrorEditor(session: session, font: CodeMirrorFont(family: "JetBrains Mono", size: 13))
+```
+
+Pass `nil` to use the system monospaced stack at the default size.
+
 `CodeMirrorSession` is main-actor owned. Its event callback is synchronous so a host reducer can accept a transaction, replace it with authoritative text, or invalidate the session before the WebKit replica receives an acknowledgement. `CodeMirrorChange` ranges and selections use UTF-16 offsets; inbound changes must carry the source preimage, which the session validates and normalizes before acceptance.
 
 Use `flush()` before saving, exporting, running, navigating, or tearing down an editor. Use `replace` for host-owned undo and redo; those replacements update replicas without generating editor events or WebKit history entries. When a reducer must apply an undo or redo replacement synchronously, `replaceImmediately(expectedRevision:changes:selection:in:)` performs the same atomic validation and replica update without an async suspension. `focusedReplicaID()` checks the current native key-window responder synchronously and returns no replica for an unmounted, hidden, inactive, invalidated, or native-form-focused view.
