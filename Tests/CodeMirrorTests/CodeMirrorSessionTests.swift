@@ -809,6 +809,61 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertNil(updatedPayload["jsonKeyOrder"])
   }
 
+  func testIndentWidthAndInvisiblesDefaultRoundTripAndRejectInvalidDecode() throws {
+    let defaults = CodeMirrorConfiguration()
+    XCTAssertEqual(defaults.indentWidth, .two)
+    XCTAssertFalse(defaults.showsInvisibles)
+    XCTAssertEqual(CodeMirrorIndentWidth.allCases.map(\.rawValue), [2, 4])
+    XCTAssertNil(CodeMirrorIndentWidth(rawValue: 3))
+
+    let configuration = CodeMirrorConfiguration(
+      language: .json, indentWidth: .four, showsInvisibles: true)
+    let encoded = try JSONEncoder().encode(configuration)
+    XCTAssertEqual(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: encoded), configuration)
+
+    var invalidObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    for invalidWidth in [0, 3, 8] {
+      invalidObject["indentWidth"] = invalidWidth
+      let invalidData = try JSONSerialization.data(withJSONObject: invalidObject)
+      XCTAssertThrowsError(
+        try JSONDecoder().decode(CodeMirrorConfiguration.self, from: invalidData))
+    }
+  }
+
+  func testIndentWidthAndInvisiblesBroadcastWithoutChangingRevision() throws {
+    let session = CodeMirrorSession(
+      initialText: "source",
+      configuration: CodeMirrorConfiguration(language: .json)
+    ) { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+
+    let initialPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertEqual((initialPayload["indentWidth"] as? NSNumber)?.intValue, 2)
+    XCTAssertEqual(initialPayload["showsInvisibles"] as? Bool, false)
+
+    let before = try session.snapshot()
+    commands.removeAll()
+    session.update(
+      configuration: CodeMirrorConfiguration(
+        language: .json, indentWidth: .four, showsInvisibles: true))
+    XCTAssertEqual(try session.snapshot(), before)
+    guard case .updateConfiguration(let updatedConfiguration) = commands.first else {
+      return XCTFail("replica did not receive indentation and invisibles update")
+    }
+    XCTAssertEqual(updatedConfiguration.indentWidth, .four)
+    XCTAssertTrue(updatedConfiguration.showsInvisibles)
+    let updatedPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertEqual((updatedPayload["indentWidth"] as? NSNumber)?.intValue, 4)
+    XCTAssertEqual(updatedPayload["showsInvisibles"] as? Bool, true)
+    session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
   func testReplicaThemeUsesNumericPayloadWithoutMutatingSharedConfiguration() throws {
     let session = CodeMirrorSession(initialText: "source") { _ in .accept }
     let replicaID = CodeMirrorReplicaID()

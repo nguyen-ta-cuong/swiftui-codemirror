@@ -1,11 +1,11 @@
 import { closeBrackets, closeBracketsKeymap, completionKeymap, autocompletion } from "@codemirror/autocomplete";
-import { indentUnit, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
+import { getIndentUnit, indentUnit, indentOnInput, bracketMatching, foldGutter, foldKeymap, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
 import { json } from "@codemirror/lang-json";
 import { xml } from "@codemirror/lang-xml";
 import { graphql } from "cm6-graphql";
 import { lintGutter, lintKeymap, setDiagnostics } from "@codemirror/lint";
 import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
-import { EditorView, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter, highlightSpecialChars, keymap, lineNumbers } from "@codemirror/view";
+import { EditorView, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter, highlightSpecialChars, highlightWhitespace, keymap, lineNumbers } from "@codemirror/view";
 import { openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { oneDark } from "@codemirror/theme-one-dark";
 
@@ -620,7 +620,11 @@ function orderedJSONTokens(tokens) {
   return result;
 }
 
-export function formatJSON(value, jsonKeyOrder = "preserve") {
+function validIndentWidth(value) {
+  return value === 4 ? 4 : 2;
+}
+
+export function formatJSON(value, jsonKeyOrder = "preserve", indentWidth = 2) {
   try {
     JSON.parse(value);
   } catch {
@@ -634,7 +638,8 @@ export function formatJSON(value, jsonKeyOrder = "preserve") {
   const lines = [];
   let current = "";
   let indentation = 0;
-  const indentationText = () => "  ".repeat(indentation);
+  const unit = " ".repeat(validIndentWidth(indentWidth));
+  const indentationText = () => unit.repeat(indentation);
   const flush = () => {
     if (current.length > 0) {
       lines.push(indentationText() + current);
@@ -837,13 +842,14 @@ function compositionValue(phase) {
   return { phase: phase.phase, id: phase.id };
 }
 
-function twoSpaceIndent(view) {
+export function indentSelectedLines(view) {
+  const unit = " ".repeat(getIndentUnit(view.state));
   const changes = [];
   for (const range of view.state.selection.ranges) {
     const first = view.state.doc.lineAt(range.from).number;
     const last = view.state.doc.lineAt(range.to).number;
     for (let lineNumber = first; lineNumber <= last; lineNumber += 1) {
-      changes.push({ from: view.state.doc.line(lineNumber).from, insert: "  " });
+      changes.push({ from: view.state.doc.line(lineNumber).from, insert: unit });
     }
   }
   if (changes.length > 0) {
@@ -852,14 +858,15 @@ function twoSpaceIndent(view) {
   return true;
 }
 
-function twoSpaceOutdent(view) {
+export function outdentSelectedLines(view) {
+  const width = getIndentUnit(view.state);
   const changes = [];
   for (const range of view.state.selection.ranges) {
     const first = view.state.doc.lineAt(range.from).number;
     const last = view.state.doc.lineAt(range.to).number;
     for (let lineNumber = first; lineNumber <= last; lineNumber += 1) {
       const line = view.state.doc.line(lineNumber);
-      const whitespace = line.text.match(/^ {1,2}/)?.[0] ?? "";
+      const whitespace = line.text.match(new RegExp(`^ {1,${width}}`))?.[0] ?? "";
       if (whitespace.length > 0) {
         changes.push({ from: line.from, to: line.from + whitespace.length });
       }
@@ -883,6 +890,8 @@ class EditorController {
       language: "text",
       isReadOnly: false,
       wrapsLines: false,
+      indentWidth: 2,
+      showsInvisibles: false,
       showsLineNumbers: true,
       maximumPendingTransactions: 64,
       appearance: { colorScheme: "light", increaseContrast: false, reduceMotion: false, reduceTransparency: false, theme: null, font: null },
@@ -920,6 +929,8 @@ class EditorController {
     this.lineNumberCompartment = new Compartment();
     this.readOnlyCompartment = new Compartment();
     this.lineWrappingCompartment = new Compartment();
+    this.indentUnitCompartment = new Compartment();
+    this.invisiblesCompartment = new Compartment();
     this.foldCompartment = new Compartment();
     this.listenerCompartment = new Compartment();
     this.handlers = [];
@@ -953,7 +964,7 @@ class EditorController {
     this.view = new EditorView({
       doc: "",
       extensions: [
-        indentUnit.of("  "),
+        this.indentUnitCompartment.of(indentUnit.of("  ")),
         drawSelection(),
         dropCursor(),
         highlightSpecialChars(),
@@ -969,8 +980,8 @@ class EditorController {
         keymap.of([
           { key: "Ctrl-Tab", run: () => this.sendFocusTraversal(true) },
           { key: "Ctrl-Shift-Tab", run: () => this.sendFocusTraversal(false) },
-          { key: "Tab", run: twoSpaceIndent },
-          { key: "Shift-Tab", run: twoSpaceOutdent },
+          { key: "Tab", run: indentSelectedLines },
+          { key: "Shift-Tab", run: outdentSelectedLines },
           { key: "Mod-z", run: () => this.sendCommand("undo") },
           { key: "Mod-y", run: () => this.sendCommand("redo") },
           { key: "Mod-Shift-z", run: () => this.sendCommand("redo") },
@@ -986,6 +997,7 @@ class EditorController {
         this.lineNumberCompartment.of(lineNumbers()),
         this.readOnlyCompartment.of(EditorState.readOnly.of(true)),
         this.lineWrappingCompartment.of([]),
+        this.invisiblesCompartment.of([]),
         this.foldCompartment.of([]),
         this.listenerCompartment.of(updateListener)
       ],
@@ -1317,6 +1329,8 @@ class EditorController {
     };
     this.configuration.appearance.theme = validTheme(this.configuration.appearance.theme);
     this.configuration.appearance.font = validFont(this.configuration.appearance.font);
+    this.configuration.indentWidth = validIndentWidth(this.configuration.indentWidth);
+    this.configuration.showsInvisibles = this.configuration.showsInvisibles === true;
     if (!this.view) {
       return;
     }
@@ -1330,6 +1344,8 @@ class EditorController {
         this.lineNumberCompartment.reconfigure(this.configuration.showsLineNumbers ? lineNumbers() : []),
         this.readOnlyCompartment.reconfigure(this.initializing || this.configuration.isReadOnly ? EditorState.readOnly.of(true) : []),
         this.lineWrappingCompartment.reconfigure(this.configuration.wrapsLines ? EditorView.lineWrapping : []),
+        this.indentUnitCompartment.reconfigure(indentUnit.of(" ".repeat(this.configuration.indentWidth))),
+        this.invisiblesCompartment.reconfigure(this.configuration.showsInvisibles ? highlightWhitespace() : []),
         this.foldCompartment.reconfigure(this.configuration.showsLineNumbers ? foldGutter() : [])
       ]
     });
@@ -1623,7 +1639,7 @@ class EditorController {
       this.post({ type: "formatResult", requestID, success: false });
       return;
     }
-    const result = formatJSON(text, this.configuration.jsonKeyOrder);
+    const result = formatJSON(text, this.configuration.jsonKeyOrder, this.configuration.indentWidth);
     if (!result.available) {
       this.post({ type: "formatResult", requestID, success: false });
       return;

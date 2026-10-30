@@ -434,6 +434,8 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     "language": configuration.language.rawValue,
     "isReadOnly": configuration.isReadOnly,
     "wrapsLines": configuration.wrapsLines,
+    "indentWidth": configuration.indentWidth.rawValue,
+    "showsInvisibles": configuration.showsInvisibles,
     "showsLineNumbers": configuration.showsLineNumbers,
     "commandTimeoutMilliseconds": configuration.commandTimeoutMilliseconds,
     "maximumPendingTransactions": configuration.maximumPendingTransactions,
