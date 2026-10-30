@@ -42,6 +42,11 @@ public enum CodeMirrorJSONKeyOrder: String, Hashable, Sendable, Codable {
   case sorted
 }
 
+public enum CodeMirrorIndentWidth: Int, CaseIterable, Hashable, Sendable, Codable {
+  case two = 2
+  case four = 4
+}
+
 public enum CodeMirrorColorScheme: String, Hashable, Sendable, Codable {
   case system
   case light
@@ -256,6 +261,8 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
   public var language: CodeMirrorLanguage
   public var isReadOnly: Bool
   public var wrapsLines: Bool
+  public var indentWidth: CodeMirrorIndentWidth
+  public var showsInvisibles: Bool
   public var showsLineNumbers: Bool
   public var commandTimeoutMilliseconds: Int
   public var maximumPendingTransactions: Int
@@ -268,6 +275,8 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     language: CodeMirrorLanguage = .text,
     isReadOnly: Bool = false,
     wrapsLines: Bool = false,
+    indentWidth: CodeMirrorIndentWidth = .two,
+    showsInvisibles: Bool = false,
     showsLineNumbers: Bool = true,
     commandTimeoutMilliseconds: Int = 2_000,
     maximumPendingTransactions: Int = 64,
@@ -279,6 +288,8 @@ public struct CodeMirrorConfiguration: Equatable, Sendable, Codable {
     self.language = language
     self.isReadOnly = isReadOnly
     self.wrapsLines = wrapsLines
+    self.indentWidth = indentWidth
+    self.showsInvisibles = showsInvisibles
     self.showsLineNumbers = showsLineNumbers
     self.commandTimeoutMilliseconds = commandTimeoutMilliseconds
     self.maximumPendingTransactions = maximumPendingTransactions

@@ -94,6 +94,12 @@ CodeMirrorEditor(session: session, font: CodeMirrorFont(family: "JetBrains Mono"
 
 Pass `nil` to use the system monospaced stack at the default size.
 
+Indentation and invisible characters are session settings on `CodeMirrorConfiguration`, so every replica of a session indents and formats the same way. `indentWidth` is `.two` or `.four` spaces and defaults to `.two`; it sets CodeMirror's indent unit, the spaces Tab inserts and Shift-Tab removes on each selected line, and the indentation `format(in:)` writes for JSON. `showsInvisibles` defaults to `false`; when `true`, the editor marks spaces with faint dots and tabs with arrows. Control and zero-width characters stay visible as placeholders either way.
+
+```swift
+CodeMirrorConfiguration(language: .json, indentWidth: .four, showsInvisibles: true)
+```
+
 `CodeMirrorSession` is main-actor owned. Its event callback is synchronous so a host reducer can accept a transaction, replace it with authoritative text, or invalidate the session before the WebKit replica receives an acknowledgement. `CodeMirrorChange` ranges and selections use UTF-16 offsets; inbound changes must carry the source preimage, which the session validates and normalizes before acceptance.
 
 Use `flush()` before saving, exporting, running, navigating, or tearing down an editor. Use `replace` for host-owned undo and redo; those replacements update replicas without generating editor events or WebKit history entries. When a reducer must apply an undo or redo replacement synchronously, `replaceImmediately(expectedRevision:changes:selection:in:)` performs the same atomic validation and replica update without an async suspension. `focusedReplicaID()` checks the current native key-window responder synchronously and returns no replica for an unmounted, hidden, inactive, invalidated, or native-form-focused view.
