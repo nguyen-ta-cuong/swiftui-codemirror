@@ -428,11 +428,14 @@ private func configurationPayload(_ configuration: CodeMirrorConfiguration) -> [
     "reduceMotion": configuration.appearance.reduceMotion,
     "reduceTransparency": configuration.appearance.reduceTransparency,
     "theme": configuration.appearance.theme.map(themePayload) ?? NSNull(),
+    "font": configuration.appearance.font.map(fontPayload) ?? NSNull(),
   ]
   var payload: [String: Any] = [
     "language": configuration.language.rawValue,
     "isReadOnly": configuration.isReadOnly,
     "wrapsLines": configuration.wrapsLines,
+    "indentWidth": configuration.indentWidth.rawValue,
+    "showsInvisibles": configuration.showsInvisibles,
     "showsLineNumbers": configuration.showsLineNumbers,
     "commandTimeoutMilliseconds": configuration.commandTimeoutMilliseconds,
     "maximumPendingTransactions": configuration.maximumPendingTransactions,
@@ -466,6 +469,13 @@ private func themePayload(_ theme: CodeMirrorTheme) -> [String: Any] {
     "border": rgbaPayload(theme.border),
     "caret": rgbaPayload(theme.caret),
     "activeLineFill": rgbaPayload(theme.activeLineFill),
+  ]
+}
+
+private func fontPayload(_ font: CodeMirrorFont) -> [String: Any] {
+  [
+    "family": font.family ?? NSNull(),
+    "size": NSNumber(value: font.size),
   ]
 }
 

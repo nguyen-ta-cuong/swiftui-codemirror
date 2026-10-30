@@ -3,14 +3,18 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { CompletionContext } from "@codemirror/autocomplete";
+import { getIndentUnit, indentUnit } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
+import { highlightWhitespace } from "@codemirror/view";
 import {
   applyChanges,
   documentDiagnostics,
   EditorController,
   formatJSON,
+  indentSelectedLines,
   isAnalysisAvailable,
   jsonLiteralCompletion,
+  outdentSelectedLines,
   validateChanges
 } from "../codemirror.js";
 
@@ -440,6 +444,145 @@ test("malformed custom theme values are rejected without entering the appearance
   controller.updateConfiguration({ appearance: { theme } });
   assert.equal(controller.configuration.appearance.theme, null);
   controller.destroy();
+});
+
+test("editor font styles the scroller so the base theme monospace rule does not win", async () => {
+  const source = await readFile(new URL("../codemirror.js", import.meta.url), "utf8");
+  assert.match(source, /"\.cm-scroller": font\s*\? \{ fontFamily: font\.family \? `"\$\{font\.family\}", \$\{defaultFontFamily\}` : defaultFontFamily, fontSize: `\$\{font\.size\}px` \}/);
+  assert.match(source, /this\.appearanceCompartment\.of\(appearanceExtension\(this\.configuration\.appearance, null, null\)\)/);
+  assert.doesNotMatch(source, /style\.setProperty\("font-family"/);
+});
+
+test("editor font reconfiguration keeps state and clears back to the default stack", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.hostRevision = 3;
+  controller.localRevision = 3;
+  controller.view.state = EditorState.create({
+    doc: "source",
+    selection: { anchor: 2, head: 5 }
+  });
+  controller.updateConfiguration({ appearance: { font: { family: "JetBrains Mono", size: 15 } } });
+  assert.deepEqual(controller.configuration.appearance.font, { family: "JetBrains Mono", size: 15 });
+  assert.equal(harness.text, "source");
+  assert.deepEqual(controller.view.state.selection.ranges.map(range => [range.from, range.to]), [[2, 5]]);
+  assert.equal(controller.hostRevision, 3);
+  assert.equal(controller.localRevision, 3);
+
+  controller.updateConfiguration({ appearance: { font: { family: null, size: 11 } } });
+  assert.deepEqual(controller.configuration.appearance.font, { family: null, size: 11 });
+  controller.updateConfiguration({ appearance: { font: null } });
+  assert.equal(controller.configuration.appearance.font, null);
+  controller.destroy();
+});
+
+test("malformed editor fonts are rejected without entering the appearance state", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  for (const font of [
+    { family: "Menlo", size: 5 },
+    { family: "Menlo", size: 73 },
+    { family: "Menlo", size: Number.NaN },
+    { family: "", size: 13 },
+    { family: "Bad\"Family", size: 13 },
+    { family: "Bad\\Family", size: 13 },
+    { family: "Bad\nFamily", size: 13 },
+    { family: "x".repeat(201), size: 13 },
+    { family: 7, size: 13 },
+    "Menlo"
+  ]) {
+    controller.updateConfiguration({ appearance: { font } });
+    assert.equal(controller.configuration.appearance.font, null, JSON.stringify(font));
+  }
+  controller.destroy();
+});
+
+test("formats JSON with four-space indentation and falls back to two for other widths", () => {
+  const source = '{"items":[true]}';
+  assert.equal(formatJSON(source, "preserve", 4).text, [
+    "{",
+    "    \"items\": [",
+    "        true",
+    "    ]",
+    "}"
+  ].join("\n"));
+  for (const width of [3, 8, "4", null, undefined]) {
+    assert.equal(formatJSON(source, "preserve", width).text, formatJSON(source).text, String(width));
+  }
+});
+
+test("controller formats JSON with the configured indent width", () => {
+  const source = '{"z":{"a":1}}';
+  const harness = makeController(source);
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.updateConfiguration({ language: "json", indentWidth: 4, jsonKeyOrder: "sorted" });
+  controller.format("four-space-format");
+  assert.equal(harness.text, formatJSON(source, "sorted", 4).text);
+  assert.equal(harness.messages.at(-1).success, true);
+  controller.destroy();
+});
+
+test("indent width and invisibles reject malformed values and fall back to defaults", () => {
+  const harness = makeController("source");
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  assert.equal(controller.configuration.indentWidth, 2);
+  assert.equal(controller.configuration.showsInvisibles, false);
+  controller.updateConfiguration({ indentWidth: 4, showsInvisibles: true });
+  assert.equal(controller.configuration.indentWidth, 4);
+  assert.equal(controller.configuration.showsInvisibles, true);
+  for (const indentWidth of [0, 3, 8, "4", 4.5, null]) {
+    controller.updateConfiguration({ indentWidth, showsInvisibles: "true" });
+    assert.equal(controller.configuration.indentWidth, 2, String(indentWidth));
+    assert.equal(controller.configuration.showsInvisibles, false);
+  }
+  controller.destroy();
+});
+
+test("Tab and Shift-Tab follow the configured indent unit and invisibles toggle whitespace", () => {
+  const harness = makeController();
+  const { controller } = harness;
+  controller.configured = true;
+  controller.initializing = false;
+  controller.view.state = EditorState.create({
+    doc: "a\n  b",
+    selection: { anchor: 0, head: 4 },
+    extensions: [
+      controller.indentUnitCompartment.of(indentUnit.of("  ")),
+      controller.invisiblesCompartment.of([])
+    ]
+  });
+  controller.updateConfiguration({ indentWidth: 4, showsInvisibles: true });
+  assert.equal(getIndentUnit(controller.view.state), 4);
+  assert.equal(controller.invisiblesCompartment.get(controller.view.state), highlightWhitespace());
+  indentSelectedLines(controller.view);
+  assert.equal(harness.text, "    a\n      b");
+  outdentSelectedLines(controller.view);
+  assert.equal(harness.text, "a\n  b");
+  outdentSelectedLines(controller.view);
+  assert.equal(harness.text, "a\nb");
+
+  controller.updateConfiguration({ indentWidth: 2, showsInvisibles: false });
+  assert.equal(getIndentUnit(controller.view.state), 2);
+  assert.deepEqual(controller.invisiblesCompartment.get(controller.view.state), []);
+  indentSelectedLines(controller.view);
+  assert.equal(harness.text, "  a\n  b");
+  controller.destroy();
+});
+
+test("the editor keeps special characters visible and binds Tab to the indent unit commands", async () => {
+  const source = await readFile(new URL("../codemirror.js", import.meta.url), "utf8");
+  assert.match(source, /this\.indentUnitCompartment\.of\(indentUnit\.of\("  "\)\),\n\s*drawSelection\(\),\n\s*dropCursor\(\),\n\s*highlightSpecialChars\(\),/);
+  assert.match(source, /\{ key: "Tab", run: indentSelectedLines \}/);
+  assert.match(source, /\{ key: "Shift-Tab", run: outdentSelectedLines \}/);
+  assert.match(source, /formatJSON\(text, this\.configuration\.jsonKeyOrder, this\.configuration\.indentWidth\)/);
 });
 
 test("runtime notices retain installed permission text and classify non-bundled locks", async () => {

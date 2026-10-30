@@ -809,6 +809,61 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertNil(updatedPayload["jsonKeyOrder"])
   }
 
+  func testIndentWidthAndInvisiblesDefaultRoundTripAndRejectInvalidDecode() throws {
+    let defaults = CodeMirrorConfiguration()
+    XCTAssertEqual(defaults.indentWidth, .two)
+    XCTAssertFalse(defaults.showsInvisibles)
+    XCTAssertEqual(CodeMirrorIndentWidth.allCases.map(\.rawValue), [2, 4])
+    XCTAssertNil(CodeMirrorIndentWidth(rawValue: 3))
+
+    let configuration = CodeMirrorConfiguration(
+      language: .json, indentWidth: .four, showsInvisibles: true)
+    let encoded = try JSONEncoder().encode(configuration)
+    XCTAssertEqual(
+      try JSONDecoder().decode(CodeMirrorConfiguration.self, from: encoded), configuration)
+
+    var invalidObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    for invalidWidth in [0, 3, 8] {
+      invalidObject["indentWidth"] = invalidWidth
+      let invalidData = try JSONSerialization.data(withJSONObject: invalidObject)
+      XCTAssertThrowsError(
+        try JSONDecoder().decode(CodeMirrorConfiguration.self, from: invalidData))
+    }
+  }
+
+  func testIndentWidthAndInvisiblesBroadcastWithoutChangingRevision() throws {
+    let session = CodeMirrorSession(
+      initialText: "source",
+      configuration: CodeMirrorConfiguration(language: .json)
+    ) { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    session.receive(.ready(sessionID: session.id, replicaID: replicaID, loadID: loadID))
+
+    let initialPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertEqual((initialPayload["indentWidth"] as? NSNumber)?.intValue, 2)
+    XCTAssertEqual(initialPayload["showsInvisibles"] as? Bool, false)
+
+    let before = try session.snapshot()
+    commands.removeAll()
+    session.update(
+      configuration: CodeMirrorConfiguration(
+        language: .json, indentWidth: .four, showsInvisibles: true))
+    XCTAssertEqual(try session.snapshot(), before)
+    guard case .updateConfiguration(let updatedConfiguration) = commands.first else {
+      return XCTFail("replica did not receive indentation and invisibles update")
+    }
+    XCTAssertEqual(updatedConfiguration.indentWidth, .four)
+    XCTAssertTrue(updatedConfiguration.showsInvisibles)
+    let updatedPayload = try XCTUnwrap(commands.first?.payload["configuration"] as? [String: Any])
+    XCTAssertEqual((updatedPayload["indentWidth"] as? NSNumber)?.intValue, 4)
+    XCTAssertEqual(updatedPayload["showsInvisibles"] as? Bool, true)
+    session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
   func testReplicaThemeUsesNumericPayloadWithoutMutatingSharedConfiguration() throws {
     let session = CodeMirrorSession(initialText: "source") { _ in .accept }
     let replicaID = CodeMirrorReplicaID()
@@ -835,6 +890,90 @@ final class CodeMirrorSessionTests: XCTestCase {
     XCTAssertEqual((backgroundPayload["red"] as? NSNumber)?.doubleValue, theme.background.red)
     XCTAssertEqual((backgroundPayload["alpha"] as? NSNumber)?.doubleValue, theme.background.alpha)
     session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
+  func testFontValidatesSizeAndFamilyAndRejectsInvalidDecode() throws {
+    let named = try XCTUnwrap(CodeMirrorFont(family: "JetBrains Mono", size: 13))
+    XCTAssertEqual(named.family, "JetBrains Mono")
+    XCTAssertEqual(named.size, 13)
+    let system = try XCTUnwrap(CodeMirrorFont(size: 6))
+    XCTAssertNil(system.family)
+    XCTAssertNotNil(CodeMirrorFont(family: String(repeating: "x", count: 200), size: 72))
+
+    for size in [Double.nan, Double.infinity, 5.9, 72.1] {
+      XCTAssertNil(CodeMirrorFont(size: size))
+    }
+    let invalidFamilies = [
+      "", "Bad\"Family", "Bad\\Family", "Bad\nFamily", String(repeating: "x", count: 201),
+    ]
+    for family in invalidFamilies {
+      XCTAssertNil(CodeMirrorFont(family: family, size: 13))
+    }
+
+    for font in [named, system] {
+      let encoded = try JSONEncoder().encode(font)
+      XCTAssertEqual(try JSONDecoder().decode(CodeMirrorFont.self, from: encoded), font)
+    }
+    let appearance = CodeMirrorAppearance(colorScheme: .dark, font: named)
+    let encodedAppearance = try JSONEncoder().encode(appearance)
+    XCTAssertEqual(
+      try JSONDecoder().decode(CodeMirrorAppearance.self, from: encodedAppearance), appearance)
+    for invalid in [#"{"family":"Menlo","size":4}"#, #"{"family":"","size":13}"#] {
+      XCTAssertThrowsError(try JSONDecoder().decode(CodeMirrorFont.self, from: Data(invalid.utf8)))
+    }
+  }
+
+  func testReplicaFontUsesPayloadWithoutMutatingSharedConfiguration() throws {
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    var commands: [CodeMirrorHostCommand] = []
+    let loadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { commands.append($0) })
+    let font = try XCTUnwrap(CodeMirrorFont(family: "JetBrains Mono", size: 15))
+
+    session.update(appearance: CodeMirrorAppearance(colorScheme: .dark, font: font), for: replicaID)
+
+    guard let command = commands.last,
+      case .updateConfiguration(let configuration) = command
+    else {
+      return XCTFail("font update did not produce a configuration command")
+    }
+    XCTAssertEqual(configuration.appearance.font, font)
+    XCTAssertNil(session.configuration.appearance.font)
+    let configurationPayload = try XCTUnwrap(command.payload["configuration"] as? [String: Any])
+    let appearancePayload = try XCTUnwrap(configurationPayload["appearance"] as? [String: Any])
+    let fontPayload = try XCTUnwrap(appearancePayload["font"] as? [String: Any])
+    XCTAssertEqual(fontPayload["family"] as? String, "JetBrains Mono")
+    XCTAssertEqual((fontPayload["size"] as? NSNumber)?.doubleValue, 15)
+
+    session.update(
+      appearance: CodeMirrorAppearance(colorScheme: .dark, font: CodeMirrorFont(size: 11)),
+      for: replicaID)
+    let systemPayload = try XCTUnwrap(
+      ((commands.last?.payload["configuration"] as? [String: Any])?["appearance"]
+        as? [String: Any])?["font"] as? [String: Any])
+    XCTAssertTrue(systemPayload["family"] is NSNull)
+    XCTAssertEqual((systemPayload["size"] as? NSNumber)?.doubleValue, 11)
+    session.detach(replicaID: replicaID, loadID: loadID)
+  }
+
+  func testResolvedAppearancePrefersEditorFontOverConfiguredFont() throws {
+    let configuredFont = try XCTUnwrap(CodeMirrorFont(family: "Menlo", size: 12))
+    let editorFont = try XCTUnwrap(CodeMirrorFont(family: "JetBrains Mono", size: 14))
+    let configuration = CodeMirrorConfiguration(
+      appearance: CodeMirrorAppearance(font: configuredFont))
+    func resolvedFont(_ font: CodeMirrorFont?) -> CodeMirrorFont? {
+      resolvedCodeMirrorAppearance(
+        configuration: configuration,
+        environmentScheme: .light,
+        systemIncreaseContrast: false,
+        accessibilityReduceMotion: false,
+        accessibilityReduceTransparency: false,
+        font: font
+      ).font
+    }
+    XCTAssertEqual(resolvedFont(nil), configuredFont)
+    XCTAssertEqual(resolvedFont(editorFont), editorFont)
   }
 
   #if os(macOS)
