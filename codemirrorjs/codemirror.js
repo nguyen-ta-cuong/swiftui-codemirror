@@ -12,6 +12,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 export const MAX_ANALYSIS_BYTES = 1024 * 1024;
 const MAX_FIND_HISTORY_SNAPSHOTS = 32;
 const MAX_FIND_HISTORY_UNITS = 1024 * 1024;
+const MAX_PENDING_FLUSH_REQUESTS = 32;
 
 export function utf8ByteLength(value) {
   return new TextEncoder().encode(value).byteLength;
@@ -997,6 +998,10 @@ class EditorController {
   }
 
   flush(requestID) {
+    if (!this.flushRequests.has(requestID) && this.flushRequests.size >= MAX_PENDING_FLUSH_REQUESTS) {
+      this.post({ type: "flushResult", requestID, success: false, code: "timeout" });
+      return;
+    }
     this.flushRequests.set(requestID, true);
     this.tryFinishFlushes();
   }

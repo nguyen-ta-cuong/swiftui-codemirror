@@ -929,7 +929,7 @@ final class CodeMirrorSessionTests: XCTestCase {
       XCTAssertEqual(results.count, 40)
       XCTAssertTrue(
         results.contains { result in
-          if case .failure(.transportFailure) = result { return true }
+          if case .failure(.timeout) = result { return true }
           return false
         })
       XCTAssertTrue(
@@ -2092,6 +2092,314 @@ final class CodeMirrorSessionTests: XCTestCase {
         if case .routeCommand = $0 { return true }
         return false
       }.count, 32)
+  }
+
+  func testPendingOperationsShareOneBudgetAcrossFlushFormatAndRoute() async throws {
+    let focus = FocusProbe()
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    _ = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+
+    let flushTasks = (0..<11).map { _ in
+      Task { @MainActor in
+        do {
+          _ = try await session.flush()
+          return Result<Void, CodeMirrorSessionError>.success(())
+        } catch let error as CodeMirrorSessionError {
+          return Result<Void, CodeMirrorSessionError>.failure(error)
+        } catch {
+          return Result<Void, CodeMirrorSessionError>.failure(.transportFailure)
+        }
+      }
+    }
+    let formatTasks = (0..<11).map { _ in
+      Task { @MainActor in
+        do {
+          _ = try await session.format(in: replicaID)
+          return Result<Void, CodeMirrorSessionError>.success(())
+        } catch let error as CodeMirrorSessionError {
+          return Result<Void, CodeMirrorSessionError>.failure(error)
+        } catch {
+          return Result<Void, CodeMirrorSessionError>.failure(.transportFailure)
+        }
+      }
+    }
+    let routeTasks = (0..<10).map { _ in
+      Task { @MainActor in
+        do {
+          _ = try await session.routeCommand(
+            .undo, in: replicaID, expecting: .contentOrCurrentFind)
+          return Result<Void, CodeMirrorSessionError>.success(())
+        } catch let error as CodeMirrorSessionError {
+          return Result<Void, CodeMirrorSessionError>.failure(error)
+        } catch {
+          return Result<Void, CodeMirrorSessionError>.failure(.transportFailure)
+        }
+      }
+    }
+
+    func requiredCommandCount() -> Int {
+      commands.reduce(into: 0) { count, command in
+        switch command {
+        case .flush, .format, .routeCommand:
+          count += 1
+        default:
+          break
+        }
+      }
+    }
+
+    for _ in 0..<100 where requiredCommandCount() < 32 {
+      await Task.yield()
+    }
+    XCTAssertEqual(requiredCommandCount(), 32)
+
+    let overflowTask = Task { @MainActor in
+      do {
+        _ = try await session.routeCommand(
+          .redo, in: replicaID, expecting: .contentOrCurrentFind)
+        return Result<Void, CodeMirrorSessionError>.success(())
+      } catch let error as CodeMirrorSessionError {
+        return Result<Void, CodeMirrorSessionError>.failure(error)
+      } catch {
+        return Result<Void, CodeMirrorSessionError>.failure(.transportFailure)
+      }
+    }
+    let overflow = await overflowTask.value
+    if case .failure(.timeout) = overflow {
+    } else {
+      XCTFail("the shared pending-operation budget did not reject overflow")
+    }
+    XCTAssertEqual(requiredCommandCount(), 32)
+    XCTAssertEqual(try session.snapshot().text, "source")
+
+    session.invalidate()
+    for task in flushTasks {
+      _ = await task.value
+    }
+    for task in formatTasks {
+      _ = await task.value
+    }
+    for task in routeTasks {
+      _ = await task.value
+    }
+  }
+
+  func testPendingOperationBudgetRecoversAfterCompletion() async throws {
+    let focus = FocusProbe()
+    var commands: [CodeMirrorHostCommand] = []
+    let session = CodeMirrorSession(initialText: "source") { _ in .accept }
+    let replicaID = CodeMirrorReplicaID()
+    let loadID = try session.attach(
+      replicaID: replicaID,
+      isFocused: { focus.value },
+      send: { commands.append($0) }
+    )
+    focus.value = true
+
+    let flushTask = Task { @MainActor in try await session.flush() }
+    let formatTask = Task { @MainActor in try await session.format(in: replicaID) }
+    let routeTask = Task { @MainActor in
+      try await session.routeCommand(.undo, in: replicaID, expecting: .contentOrCurrentFind)
+    }
+    var flushRequestID: UUID?
+    var formatRequestID: UUID?
+    var routeRequestID: UUID?
+    for _ in 0..<100 where flushRequestID == nil || formatRequestID == nil || routeRequestID == nil
+    {
+      await Task.yield()
+      flushRequestID =
+        commands.compactMap { command in
+          if case .flush(let requestID) = command { return requestID }
+          return nil
+        }.first
+      formatRequestID =
+        commands.compactMap { command in
+          if case .format(let requestID) = command { return requestID }
+          return nil
+        }.first
+      routeRequestID =
+        commands.compactMap { command in
+          if case .routeCommand(let requestID, _) = command { return requestID }
+          return nil
+        }.first
+    }
+    guard let flushRequestID, let formatRequestID, let routeRequestID else {
+      XCTFail("mixed pending operation commands were not sent")
+      session.invalidate()
+      _ = await flushTask.result
+      _ = await formatTask.result
+      _ = await routeTask.result
+      return
+    }
+
+    session.receive(
+      .flushResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        requestID: flushRequestID,
+        success: true,
+        code: nil
+      ))
+    session.receive(
+      .formatResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        requestID: formatRequestID,
+        success: true
+      ))
+    session.receive(
+      .commandRouteResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        revision: .zero,
+        requestID: routeRequestID,
+        command: .undo,
+        expectation: .contentOrCurrentFind,
+        result: .unavailable
+      ))
+    let flushSnapshot = try await flushTask.value
+    let formatSnapshot = try await formatTask.value
+    let routeResult = try await routeTask.value
+    XCTAssertEqual(flushSnapshot.text, "source")
+    XCTAssertEqual(formatSnapshot.text, "source")
+    XCTAssertEqual(routeResult, .unavailable)
+
+    let recoveredFlush = Task { @MainActor in try await session.flush() }
+    var recoveredRequestID: UUID?
+    for _ in 0..<20 where recoveredRequestID == nil {
+      await Task.yield()
+      recoveredRequestID =
+        commands.compactMap { command in
+          if case .flush(let requestID) = command, requestID != flushRequestID {
+            return requestID
+          }
+          return nil
+        }.last
+    }
+    guard let recoveredRequestID else {
+      XCTFail("operation budget did not recover after completion")
+      session.invalidate()
+      _ = await recoveredFlush.result
+      return
+    }
+    session.receive(
+      .flushResult(
+        sessionID: session.id,
+        replicaID: replicaID,
+        loadID: loadID,
+        requestID: recoveredRequestID,
+        success: true,
+        code: nil
+      ))
+    let recoveredSnapshot = try await recoveredFlush.value
+    XCTAssertEqual(recoveredSnapshot.text, "source")
+  }
+
+  func testDetachedAndReplacedReplicasDoNotRetainAcceptedRevisionKeys() throws {
+    var transactionTexts: [String] = []
+    var errors: [CodeMirrorSessionError] = []
+    let session = CodeMirrorSession(initialText: "source") { event in
+      switch event {
+      case .transaction(_, let snapshot):
+        transactionTexts.append(snapshot.text)
+      case .failure(_, let error):
+        errors.append(error)
+      default:
+        break
+      }
+      return .accept
+    }
+    let replicaID = CodeMirrorReplicaID()
+    let firstLoadID = try session.attach(replicaID: replicaID, isFocused: { false }, send: { _ in })
+
+    func receive(
+      _ loadID: UUID,
+      baseRevision: CodeMirrorRevision,
+      revision: CodeMirrorRevision,
+      text: String,
+      removedText: String
+    ) {
+      session.receive(
+        .transaction(
+          CodeMirrorTransaction(
+            sessionID: session.id,
+            replicaID: replicaID,
+            loadID: loadID,
+            baseRevision: baseRevision,
+            revision: revision,
+            changes: [
+              CodeMirrorChange(
+                rangeUTF16: 0..<removedText.utf16.count,
+                insertedText: text,
+                removedText: removedText
+              )
+            ],
+            selectionBefore: CodeMirrorSelection(anchorUTF16: 0, headUTF16: 0),
+            selectionAfter: CodeMirrorSelection(
+              anchorUTF16: text.utf16.count, headUTF16: text.utf16.count)
+          )))
+    }
+
+    receive(
+      firstLoadID,
+      baseRevision: .zero,
+      revision: CodeMirrorRevision(1),
+      text: "first",
+      removedText: "source"
+    )
+    XCTAssertEqual(try session.snapshot().text, "first")
+
+    let replacementLoadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { _ in })
+    receive(
+      replacementLoadID,
+      baseRevision: .zero,
+      revision: CodeMirrorRevision(1),
+      text: "stale replacement",
+      removedText: "source"
+    )
+    XCTAssertEqual(errors.count, 1)
+    XCTAssertEqual(try session.snapshot().text, "first")
+    receive(
+      replacementLoadID,
+      baseRevision: CodeMirrorRevision(1),
+      revision: CodeMirrorRevision(2),
+      text: "second",
+      removedText: "first"
+    )
+    XCTAssertEqual(try session.snapshot().text, "second")
+
+    session.detach(replicaID: replicaID, loadID: replacementLoadID)
+    let detachedReplacementLoadID = try session.attach(
+      replicaID: replicaID, isFocused: { false }, send: { _ in })
+    receive(
+      detachedReplacementLoadID,
+      baseRevision: CodeMirrorRevision(1),
+      revision: CodeMirrorRevision(2),
+      text: "stale detached",
+      removedText: "first"
+    )
+    XCTAssertEqual(errors.count, 2)
+    XCTAssertEqual(try session.snapshot().text, "second")
+    receive(
+      detachedReplacementLoadID,
+      baseRevision: CodeMirrorRevision(2),
+      revision: CodeMirrorRevision(3),
+      text: "third",
+      removedText: "second"
+    )
+    XCTAssertEqual(try session.snapshot().text, "third")
+    XCTAssertEqual(transactionTexts, ["first", "second", "third"])
   }
 
   #if os(macOS) && canImport(AppKit) && canImport(WebKit)
